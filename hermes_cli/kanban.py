@@ -859,6 +859,42 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_gc.add_argument("--log-retention-days", type=int, default=30,
                       help="Delete worker log files older than N days (default: 30)")
 
+    # --- sync ---
+    p_sync = sub.add_parser(
+        "sync",
+        help="External board sync (Fizzy, ...): init / once / status",
+        description=(
+            "Mirror this board to an external kanban service. Configure "
+            "kanban.sync in config.yaml; the gateway then syncs "
+            "continuously. These subcommands cover bootstrap (init), "
+            "manual one-shot passes (once), and inspection (status). "
+            "See docs/kanban/external-sync.md."
+        ),
+    )
+    sync_sub = p_sync.add_subparsers(dest="sync_action")
+    p_sync_init = sync_sub.add_parser(
+        "init",
+        help="Verify auth, create the mapped columns remotely, record the pairing",
+    )
+    p_sync_init.add_argument(
+        "--remote-board", dest="remote_board",
+        help="Remote board id to pair with the current board",
+    )
+    p_sync_once = sync_sub.add_parser(
+        "once", help="Run one sync pass for this board's pairings",
+    )
+    p_sync_once.add_argument(
+        "--remote-board", dest="remote_board",
+        help="Limit to this pairing (creates an ad-hoc one if unconfigured)",
+    )
+    p_sync_once.add_argument(
+        "--full", action="store_true",
+        help="Force a full rescan (ignore the change cursor)",
+    )
+    sync_sub.add_parser(
+        "status", help="Show pairings, cursors, link counts, last errors",
+    )
+
     kanban_parser.set_defaults(_kanban_parser=kanban_parser)
     return kanban_parser
 
@@ -974,6 +1010,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "specify":  _cmd_specify,
             "decompose":  _cmd_decompose,
             "gc":       _cmd_gc,
+            "sync":     _cmd_sync,
         }
         handler = handlers.get(action)
         if not handler:
@@ -2697,6 +2734,14 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
     if not all_flag:
         return 0 if ok_count == 1 else 1
     return 0 if (ok_count > 0 or not ids) else 1
+
+
+def _cmd_sync(args: argparse.Namespace) -> int:
+    """External board sync: init / once / status. Bodies live in
+    hermes_cli/kanban_sync/cli.py; imported lazily so non-sync users
+    never pay the httpx import."""
+    from hermes_cli.kanban_sync.cli import cmd_sync
+    return cmd_sync(args)
 
 
 def _cmd_gc(args: argparse.Namespace) -> int:
