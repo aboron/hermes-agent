@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,10 +11,23 @@ import pytest
 
 from hermes_cli import kanban_db as kb
 from hermes_cli.kanban import build_parser, kanban_command
-from hermes_cli.kanban_sync import registry as sync_registry
 from hermes_cli.kanban_sync import state
 
 from tests.hermes_cli.kanban_sync_fakes import FakeKanbanProvider
+
+
+def _live_registry():
+    """Resolve the registry through sys.modules at call time.
+
+    Some suite-mates (test_kanban_default_assignee.py) purge hermes_cli*
+    from sys.modules, so a module-level import captured at collection can
+    be a stale copy — while kanban_command's lazy import of
+    hermes_cli.kanban_sync.cli resolves the fresh one. Registering the
+    fake on the stale registry makes the CLI see only the builtin
+    provider ("unknown provider 'fake'"). Always register on the live
+    module instead.
+    """
+    return importlib.import_module("hermes_cli.kanban_sync.registry")
 
 
 @pytest.fixture
@@ -28,6 +42,7 @@ def kanban_home(tmp_path, monkeypatch):
 
 @pytest.fixture
 def fake_provider(kanban_home, monkeypatch):
+    sync_registry = _live_registry()
     provider = FakeKanbanProvider()
     sync_registry._reset_for_tests()
     sync_registry.register_provider("fake", lambda cfg: provider)
@@ -45,10 +60,10 @@ def fake_provider(kanban_home, monkeypatch):
             },
         },
     }
-    import hermes_cli.config as config_mod
+    config_mod = importlib.import_module("hermes_cli.config")
     monkeypatch.setattr(config_mod, "load_config", lambda: cfg)
     yield provider
-    sync_registry._reset_for_tests()
+    _live_registry()._reset_for_tests()
 
 
 def _args(**kw):
