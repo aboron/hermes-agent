@@ -2667,6 +2667,58 @@ DEFAULT_CONFIG = {
         # worker process (if still running host-locally) is terminated
         # before the reclaim.  0 disables stale detection entirely.
         "dispatch_stale_timeout_seconds": 14400,
+        # External kanban sync. When enabled, the gateway keeps each paired
+        # remote board (Fizzy, ...) and its local board in step
+        # bidirectionally: cards filed in the remote UI become local tasks,
+        # local status changes move cards between remote columns, comments
+        # flow both ways with provenance prefixes. The local SQLite board
+        # stays the operational source of truth (dispatcher, claims, runs).
+        # See docs/kanban/external-sync.md.
+        "sync": {
+            "enabled": False,
+            # Provider registry name. "fizzy" ships in-tree.
+            "provider": "fizzy",
+            # Seconds between sync polls.
+            "interval_seconds": 30,
+            # Board pairings: [{"board": "", "remote_board": "<board id>"}].
+            # "board" is the local board slug ("" = default board);
+            # "remote_board" is the provider's board id.
+            "pairings": [],
+            # hermes status -> remote column name. done/archived map to the
+            # provider's closed / not-now states, never to columns; triage
+            # maps to the provider's untriaged inbox.
+            "column_map": {
+                "todo": "Todo",
+                "ready": "Ready",
+                "running": "In Progress",
+                "review": "Review",
+                "blocked": "Blocked",
+                "scheduled": "Blocked",
+            },
+            # Which remote cards become local tasks: "all" (every published,
+            # non-closed, non-archived card) or "columns" (only cards in the
+            # listed column names; already-linked cards keep syncing).
+            "intake": {"mode": "all", "columns": []},
+            # Local -> remote export of tasks created outside the sync.
+            # backfill=false only exports tasks created after the pairing.
+            "export": {"enabled": True, "backfill": False},
+            # Assignee for imported cards when no 'assignee:<profile>' tag is
+            # present. Falls back to kanban.default_assignee, then unassigned.
+            "default_assignee": "",
+            # Priority stamped on imported cards marked golden in Fizzy.
+            "golden_priority": 2,
+            # Every N polls, run a full rescan (cursor reset) to catch
+            # remote deletes and moves a cursor pull can miss. 0 disables.
+            "full_resync_every": 60,
+            # Fizzy provider settings. token wins over token_env.
+            "fizzy": {
+                "base_url": "",
+                "account_slug": "",
+                "token": "",
+                "token_env": "HERMES_FIZZY_TOKEN",
+                "timeout_seconds": 15,
+            },
+        },
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.

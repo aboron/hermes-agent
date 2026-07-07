@@ -1721,6 +1721,7 @@ from gateway.session import (
 from gateway.delivery import DeliveryRouter, looks_like_telegram_private_chat_id
 from gateway.authz_mixin import GatewayAuthorizationMixin
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
+from gateway.kanban_sync_watcher import GatewayKanbanSyncWatcherMixin
 from gateway.slash_commands import GatewaySlashCommandsMixin
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -2735,7 +2736,7 @@ async def _dispose_unused_adapter(adapter: "BasePlatformAdapter | None") -> None
         )
 
 
-class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin):
+class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewayKanbanSyncWatcherMixin, GatewaySlashCommandsMixin):
     """
     Main gateway controller.
 
@@ -7185,6 +7186,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # When false, users run `hermes kanban daemon` externally or
         # simply don't use kanban; this loop becomes a no-op.
         asyncio.create_task(self._kanban_dispatcher_watcher())
+
+        # Start background external kanban sync — mirrors paired boards to
+        # a remote service (Fizzy, ...). Gated by `kanban.sync.enabled`
+        # (default False); a no-op unless the user configures a pairing.
+        asyncio.create_task(self._kanban_sync_watcher())
 
         # Start background reconnection watcher for platforms that failed at startup
         if self._failed_platforms:
