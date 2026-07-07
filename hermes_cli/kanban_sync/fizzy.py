@@ -326,6 +326,7 @@ class FizzyProvider(KanbanSyncProvider):
             creator=str(creator.get("name") or ""),
             url=str(data.get("url") or ""),
             last_active_at=data.get("last_active_at"),
+            draft=data.get("status") == "drafted",
         )
 
     @staticmethod

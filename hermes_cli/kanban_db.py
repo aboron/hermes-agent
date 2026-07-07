@@ -3121,6 +3121,24 @@ def _append_event(
     )
 
 
+def append_task_event(
+    conn: sqlite3.Connection,
+    task_id: str,
+    kind: str,
+    payload: Optional[dict] = None,
+    *,
+    run_id: Optional[int] = None,
+) -> None:
+    """Public, self-transacting wrapper around :func:`_append_event`.
+
+    For auxiliary writers (kanban-sync conflict audit trail) that need to
+    record an event outside the structured verbs. Do NOT call from inside
+    an open ``write_txn`` — use ``_append_event`` there instead.
+    """
+    with write_txn(conn):
+        _append_event(conn, task_id, kind, payload, run_id=run_id)
+
+
 def _end_run(
     conn: sqlite3.Connection,
     task_id: str,

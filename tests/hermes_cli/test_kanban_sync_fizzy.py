@@ -331,3 +331,17 @@ def test_list_comments_since_ref_returns_only_newer():
     assert [c.ref for c in newer] == ["m3"]
     assert newer[0].body_text == "three"
     assert newer[0].author == "marty"
+
+
+def test_card_drafted_status_maps_to_draft_flag():
+    def handler(request):
+        return httpx.Response(200, json=_card_json(42, status="drafted"))
+
+    assert _provider(handler).get_card("42").draft is True
+
+
+def test_card_published_status_is_not_draft():
+    def handler(request):
+        return httpx.Response(200, json=_card_json(42))
+
+    assert _provider(handler).get_card("42").draft is False

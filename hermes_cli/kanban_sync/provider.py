@@ -67,6 +67,9 @@ class RemoteCard:
     creator: str
     url: str
     last_active_at: Optional[str]
+    # Unpublished draft (Fizzy: status == "drafted"). Drafts are never
+    # imported — the author hasn't finished writing them.
+    draft: bool = False
 
 
 @dataclass(frozen=True)
