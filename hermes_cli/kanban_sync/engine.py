@@ -36,7 +36,7 @@ import logging
 import sqlite3
 import time
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli.kanban_sync import state
@@ -274,6 +274,18 @@ class KanbanSyncEngine:
     def _local_fp(task) -> str:
         return state.fingerprint(task.title, task.body, task.status, task.priority)
 
+    @staticmethod
+    def _one_line(text: Any, limit: int = 300) -> str:
+        """Collapse untrusted remote text to a single bounded line.
+
+        Card titles and comment authors render into structural positions
+        of worker prompts (the task heading, the ``comment from ...``
+        framing line in build_worker_context); embedded newlines would
+        let remote content forge those frames. Bodies stay multi-line —
+        they are ordinary task text with no structural authority.
+        """
+        return " ".join(str(text or "").split())[:limit]
+
     def _footer(self, url: str) -> str:
         return f"[{self.provider.name}] {url}"
 
@@ -469,7 +481,7 @@ class KanbanSyncEngine:
         # task back instead of a duplicate.
         task_id = kb.create_task(
             conn,
-            title=card.title.strip() or "(untitled card)",
+            title=self._one_line(card.title) or "(untitled card)",
             body=self._compose_body(card.body_text, card.url),
             assignee=assignee,
             priority=golden_priority if card.golden else 0,
@@ -543,7 +555,7 @@ class KanbanSyncEngine:
         return result
 
     def _apply_remote_fields(self, conn: sqlite3.Connection, task, card: RemoteCard) -> bool:
-        desired_title = card.title.strip() or task.title
+        desired_title = self._one_line(card.title) or task.title
         desired_body = self._compose_body(card.body_text, card.url)
         title = desired_title if desired_title != task.title else None
         body = desired_body if desired_body != (task.body or "") else None
@@ -843,9 +855,10 @@ class KanbanSyncEngine:
                     body = comment.body_text
                     if not body.strip():
                         body = "[non-text comment]"
+                    author = self._one_line(comment.author, limit=120) or "unknown"
                     local_id = kb.add_comment(
                         conn, task_id,
-                        author=f"fizzy:{comment.author or 'unknown'}",
+                        author=f"fizzy:{author}",
                         body=body,
                     )
                     state.record_pushed_comment(
