@@ -43,7 +43,8 @@ def _card_json(number=42, **overrides):
         "number": number,
         "url": f"{BASE}/{ACCT}/cards/{number}",
         "title": f"Card {number}",
-        "description": "<p>body</p>",
+        "description": "body",
+        "description_html": "<p>body</p>",
         "status": "published",
         "closed": False,
         "golden": False,
@@ -195,7 +196,7 @@ def test_list_changed_cards_stops_at_cursor_with_overlap():
 
     def handler(request):
         url = str(request.url)
-        if "indexed_by=not_now" in url:
+        if "indexed_by=not_now" in url or "indexed_by=closed" in url:
             return httpx.Response(200, json=[])
         pages["count"] += 1
         return httpx.Response(200, json=[
@@ -345,3 +346,88 @@ def test_card_published_status_is_not_draft():
         return httpx.Response(200, json=_card_json(42))
 
     assert _provider(handler).get_card("42").draft is False
+
+
+# ---------------------------------------------------------------------------
+# Review-driven fidelity fixes
+# ---------------------------------------------------------------------------
+
+def test_follow_create_handles_relative_location():
+    """Fizzy emits path-relative Location headers that already contain the
+    account slug (boards.md example: '/897362094/boards/x.json'). Following
+    them must not double the account slug."""
+    seen = []
+
+    def handler(request):
+        seen.append(str(request.url))
+        if request.method == "POST":
+            return httpx.Response(
+                201, headers={"Location": f"/{ACCT}/cards/77.json"},
+            )
+        return httpx.Response(200, json=_card_json(77))
+
+    card = _provider(handler).create_card("b1", title="t", body_text="")
+    assert card.ref == "77"
+    assert seen[-1] == f"{BASE}/{ACCT}/cards/77.json"
+
+
+def test_add_comment_ref_strips_json_suffix():
+    def handler(request):
+        return httpx.Response(
+            201,
+            headers={"Location": f"/{ACCT}/cards/42/comments/m99.json"},
+        )
+
+    assert _provider(handler).add_comment("42", "hello") == "m99"
+
+
+def test_list_changed_cards_runs_closed_sweep():
+    """`indexed_by=all` is not documented to include Done cards; a closed
+    card returned only by the dedicated closed index must still be pulled."""
+    def handler(request):
+        url = str(request.url)
+        if "indexed_by=closed" in url:
+            return httpx.Response(200, json=[_card_json(9, closed=True)])
+        if "indexed_by=not_now" in url:
+            return httpx.Response(200, json=[])
+        return httpx.Response(200, json=[_card_json(42)])
+
+    cards, _ = _provider(handler).list_changed_cards("b1", cursor=None)
+    by_ref = {c.ref: c for c in cards}
+    assert by_ref["9"].closed is True
+    assert "42" in by_ref
+
+
+def test_description_html_preferred_and_plain_description_untouched():
+    def handler(request):
+        if "43" in request.url.path:
+            # No description_html: description is plain text and must not
+            # be fed through the HTML parser (would eat '<' sequences).
+            return httpx.Response(200, json=_card_json(
+                43, description="use x < y here", description_html=None,
+            ))
+        return httpx.Response(200, json=_card_json(
+            42,
+            description="a < b",
+            description_html="<p>a &lt; b</p>",
+        ))
+
+    p = _provider(handler)
+    assert p.get_card("42").body_text == "a < b"
+    assert p.get_card("43").body_text == "use x < y here"
+
+
+def test_postponed_field_marks_archived():
+    def handler(request):
+        return httpx.Response(200, json=_card_json(42, postponed=True))
+
+    assert _provider(handler).get_card("42").archived is True
+
+
+def test_move_card_out_of_not_now_via_triage():
+    h = _SequenceHandler(_card_json(42, postponed=True))
+    _provider(h).move_card("42", column_ref=None)
+    assert h.calls == [("DELETE", "/cards/42/triage")]
+    h2 = _SequenceHandler(_card_json(42, postponed=True))
+    _provider(h2).move_card("42", column_ref="c9")
+    assert h2.calls == [("POST", "/cards/42/triage")]

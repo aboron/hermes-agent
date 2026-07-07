@@ -228,6 +228,20 @@ class FizzyClient:
                 yield from data
             url = resp.links.get("next", {}).get("url")
 
+    def _absolute(self, location: str) -> str:
+        """Resolve a Location header to a full URL.
+
+        Fizzy emits path-relative Locations that already contain the
+        account slug (boards.md: ``Location: /897362094/boards/x.json``),
+        so they must be joined to the bare base URL — routing them through
+        ``request``'s account-scoped path join would double the slug.
+        """
+        if location.startswith(("http://", "https://")):
+            return location
+        if location.startswith("/"):
+            return f"{self._base}{location}"
+        return self._url(f"/{location}")
+
     def _follow_create(self, resp: httpx.Response) -> dict:
         """Resolve a 201 response to the created object's JSON.
 
@@ -243,7 +257,7 @@ class FizzyClient:
         location = resp.headers.get("Location")
         if not location:
             raise SyncProviderError("create returned neither body nor Location")
-        return self.request("GET", location).json()
+        return self.request("GET", self._absolute(location)).json()
 
 
 # ---------------------------------------------------------------------------
@@ -314,13 +328,25 @@ class FizzyProvider(KanbanSyncProvider):
     def _card_to_dto(self, data: dict, *, archived: bool = False) -> RemoteCard:
         column = data.get("column") or None
         creator = data.get("creator") or {}
+        # Card payloads carry the plain-text rendering in ``description``
+        # and the rich text in ``description_html`` — only the latter may
+        # be fed through the HTML parser (parsing plain text would eat
+        # literal '<' sequences and double-unescape entities).
+        description_html = data.get("description_html")
+        if description_html is not None:
+            body_text = _html_to_text(str(description_html))
+        else:
+            body_text = str(data.get("description") or "")
         return RemoteCard(
             ref=str(data.get("number")),
             title=str(data.get("title") or ""),
-            body_text=_html_to_text(str(data.get("description") or "")),
+            body_text=body_text,
             column_ref=str(column["id"]) if column and column.get("id") is not None else None,
             closed=bool(data.get("closed")),
-            archived=archived,
+            # ``postponed`` (present on some payloads) encodes "Not Now"
+            # directly; the not_now sweep remains the fallback signal for
+            # servers that omit it.
+            archived=archived or bool(data.get("postponed")),
             golden=bool(data.get("golden")),
             tags=self._tag_titles(data.get("tags")),
             creator=str(creator.get("name") or ""),
@@ -384,11 +410,14 @@ class FizzyProvider(KanbanSyncProvider):
                 if last_active and (max_seen is None or last_active > max_seen):
                     max_seen = last_active
 
-        # Main sweep covers inbox/column/closed cards. "Not Now" cards are
-        # only identifiable via their dedicated index (the card payload has
-        # no field for it), so a second sweep flags them — and catches
-        # recently-archived cards even if the main index omits them.
+        # The docs don't define what ``indexed_by=all`` includes (the
+        # separate maybe/closed/not_now indexes suggest it may mirror the
+        # board view and exclude Done / Not Now), so sweep the terminal
+        # indexes explicitly: ``closed`` so completions are never missed,
+        # and ``not_now`` last so its archived flag wins for cards the
+        # other sweeps also returned.
         sweep("all", archived=False)
+        sweep("closed", archived=False)
         sweep("not_now", archived=True)
         return list(changed.values()), max_seen
 
@@ -442,13 +471,14 @@ class FizzyProvider(KanbanSyncProvider):
             self._client.request("POST", f"/cards/{card_ref}/not_now")
             return
         if column_ref is not None:
-            if current.column_ref != column_ref or current.closed:
+            if current.column_ref != column_ref or current.closed or current.archived:
+                # Triaging is also the documented way out of "Not Now".
                 self._client.request(
                     "POST", f"/cards/{card_ref}/triage",
                     json={"column_id": column_ref},
                 )
         else:
-            if current.column_ref is not None or current.closed:
+            if current.column_ref is not None or current.closed or current.archived:
                 self._client.request("DELETE", f"/cards/{card_ref}/triage")
 
     # -- comments ------------------------------------------------------------
@@ -483,6 +513,8 @@ class FizzyProvider(KanbanSyncProvider):
             pass
         location = resp.headers.get("Location") or ""
         ref = location.rstrip("/").rsplit("/", 1)[-1]
+        if ref.endswith(".json"):
+            ref = ref[: -len(".json")]
         if not ref:
             raise SyncProviderError("comment create returned no id/Location")
         return ref
