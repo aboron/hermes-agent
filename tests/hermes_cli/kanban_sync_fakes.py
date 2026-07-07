@@ -31,6 +31,26 @@ class FakeKanbanProvider(KanbanSyncProvider):
         self._seq = 0
         self._card_n = 0
         self._comment_n = 0
+        self._col_n = 0
+        # Failure injection: op name -> queue of exceptions; each matching
+        # call pops and raises one until the queue is empty.
+        self.fail_ops: "dict[str, list[Exception]]" = {}
+        # Content-based poison: add_comment raises while any marker is in
+        # the body (persistent until the test clears the set).
+        self.poison_comment_bodies: "set[str]" = set()
+        # Concurrency hooks: op name -> callable(*args) run at op start.
+        self.hooks: "dict[str, object]" = {}
+        # Mimic providers whose single-card payload can't express the
+        # archived state (Fizzy without the `postponed` field).
+        self.get_card_hides_archived = False
+
+    def _maybe_fail(self, op: str, *args) -> None:
+        hook = self.hooks.get(op)
+        if hook is not None:
+            hook(*args)
+        queue = self.fail_ops.get(op)
+        if queue:
+            raise queue.pop(0)
 
     # -- test helpers (simulate the remote human) ---------------------------
 
@@ -151,7 +171,8 @@ class FakeKanbanProvider(KanbanSyncProvider):
 
     def create_column(self, board_ref, name):
         self.writes.append(("create_column", name))
-        ref = f"c{len(self.columns) + 1}"
+        self._col_n += 1
+        ref = f"c{self._col_n}"
         self.columns[name] = ref
         return RemoteColumn(ref=ref, name=name)
 
@@ -165,9 +186,14 @@ class FakeKanbanProvider(KanbanSyncProvider):
         return cards, new_cursor
 
     def get_card(self, card_ref):
+        self._maybe_fail("get_card", card_ref)
         if card_ref not in self.cards:
             raise SyncNotFoundError(card_ref)
-        return self._dto(card_ref)
+        dto = self._dto(card_ref)
+        if self.get_card_hides_archived and dto.archived:
+            import dataclasses
+            dto = dataclasses.replace(dto, archived=False)
+        return dto
 
     def create_card(self, board_ref, *, title, body_text):
         self.writes.append(("create_card", title))
@@ -193,8 +219,11 @@ class FakeKanbanProvider(KanbanSyncProvider):
         self._bump(card_ref)
 
     def move_card(self, card_ref, *, column_ref, closed=False, archived=False):
+        self._maybe_fail("move_card", card_ref)
         if card_ref not in self.cards:
             raise SyncNotFoundError(card_ref)
+        if column_ref is not None and column_ref not in self.columns.values():
+            raise SyncNotFoundError(f"column {column_ref}")
         self.writes.append(("move_card", card_ref, column_ref, closed, archived))
         card = self.cards[card_ref]
         card["closed"] = closed
@@ -203,6 +232,7 @@ class FakeKanbanProvider(KanbanSyncProvider):
         self._bump(card_ref)
 
     def list_comments(self, card_ref, *, since_ref):
+        self._maybe_fail("list_comments", card_ref)
         comments = list(self.comments.get(card_ref, ()))
         if since_ref is None:
             return comments
@@ -212,6 +242,10 @@ class FakeKanbanProvider(KanbanSyncProvider):
         return comments
 
     def add_comment(self, card_ref, body_text):
+        from hermes_cli.kanban_sync.provider import SyncProviderError
+        self._maybe_fail("add_comment", card_ref, body_text)
+        if any(marker in body_text for marker in self.poison_comment_bodies):
+            raise SyncProviderError(f"422 rejected: {body_text[:40]}")
         if card_ref not in self.cards:
             raise SyncNotFoundError(card_ref)
         self.writes.append(("add_comment", card_ref, body_text))

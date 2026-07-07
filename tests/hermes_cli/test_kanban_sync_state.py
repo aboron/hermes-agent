@@ -198,3 +198,50 @@ def test_fingerprint_stable_and_discriminating():
 
 def test_fingerprint_distinguishes_none_from_empty_string():
     assert state.fingerprint(None) != state.fingerprint("")
+
+
+def test_ensure_schema_recovers_after_db_recreate(kanban_home):
+    conn = kb.connect()
+    state.ensure_schema(conn)
+    state.get_or_create_pairing(conn, provider="fizzy", remote_board_ref="b1")
+    conn.close()
+    # Operator resets the board: main tables recreated, sync tables gone.
+    db_path = kb.kanban_db_path()
+    db_path.unlink()
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        state.ensure_schema(conn)  # must not be suppressed by a stale cache
+        assert state.list_pairings(conn) == []
+        state.get_or_create_pairing(conn, provider="fizzy", remote_board_ref="b1")
+    finally:
+        conn.close()
+
+
+def test_pairing_lock_is_exclusive(kanban_home):
+    h1 = state.acquire_pairing_lock(
+        board=None, provider="fizzy", remote_board_ref="b1",
+    )
+    assert h1 is not None
+    h2 = state.acquire_pairing_lock(
+        board=None, provider="fizzy", remote_board_ref="b1",
+    )
+    assert h2 is None
+    state.release_pairing_lock(h1)
+    h3 = state.acquire_pairing_lock(
+        board=None, provider="fizzy", remote_board_ref="b1",
+    )
+    assert h3 is not None
+    state.release_pairing_lock(h3)
+
+
+def test_is_local_comment_pushed(conn):
+    p = state.get_or_create_pairing(conn, provider="fizzy", remote_board_ref="b1")
+    assert state.is_local_comment_pushed(conn, p["id"], "t_1", 5) is False
+    state.record_pushed_comment(
+        conn, p["id"], remote_comment_ref="m1", task_id="t_1", local_comment_id=5,
+    )
+    assert state.is_local_comment_pushed(conn, p["id"], "t_1", 5) is True
+    assert state.is_local_comment_pushed(conn, p["id"], "t_1", 6) is False
+    assert state.is_local_comment_pushed(conn, p["id"], "t_2", 5) is False

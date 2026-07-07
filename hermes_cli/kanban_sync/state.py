@@ -76,23 +76,20 @@ SYNC_SCHEMA_STATEMENTS = (
     """,
 )
 
-# Resolved main-DB paths that already ran ensure_schema this process.
-_ENSURED_PATHS: "set[str]" = set()
-
-
 def ensure_schema(conn: sqlite3.Connection) -> None:
     """Create the sync tables if missing. Idempotent; call outside any
     open transaction (DDL here is CREATE IF NOT EXISTS, committed
-    immediately)."""
-    row = conn.execute("PRAGMA database_list").fetchone()
-    db_path = row["file"] if row and row["file"] else None
-    if db_path and db_path in _ENSURED_PATHS:
-        return
+    immediately).
+
+    Deliberately NOT cached per-process: the DB file at a path can be
+    deleted and recreated under a long-lived gateway (board reset), and a
+    stale "already ensured" cache would suppress the only code path that
+    can recreate these tables. Four CREATE IF NOT EXISTS statements per
+    sync tick are noise next to the network round-trips.
+    """
     for stmt in SYNC_SCHEMA_STATEMENTS:
         conn.execute(stmt)
     conn.commit()
-    if db_path:
-        _ENSURED_PATHS.add(db_path)
 
 
 def fingerprint(*parts: Any) -> str:
@@ -306,3 +303,72 @@ def is_pushed_comment(
         (pairing_id, remote_comment_ref),
     ).fetchone()
     return row is not None
+
+
+def is_local_comment_pushed(
+    conn: sqlite3.Connection, pairing_id: int, task_id: str, local_comment_id: int,
+) -> bool:
+    """True when this local comment already has a remote counterpart —
+    either pushed by the engine or created BY an import (imports record
+    their local rowid too). The ledger, not author heuristics or cursor
+    positions, is what makes the outbound comment leg idempotent."""
+    row = conn.execute(
+        "SELECT 1 FROM kanban_sync_pushed_comments "
+        "WHERE pairing_id = ? AND task_id = ? AND local_comment_id = ?",
+        (pairing_id, task_id, local_comment_id),
+    ).fetchone()
+    return row is not None
+
+
+# ---------------------------------------------------------------------------
+# Per-pairing advisory lock
+# ---------------------------------------------------------------------------
+
+def _pairing_lock_path(board, provider: str, remote_board_ref: str):
+    digest = hashlib.sha256(
+        f"{provider}:{remote_board_ref}".encode("utf-8")
+    ).hexdigest()[:12]
+    return kb.kanban_db_path(board).parent / f".sync-{digest}.lock"
+
+
+def acquire_pairing_lock(*, board, provider: str, remote_board_ref: str):
+    """Exclusive non-blocking advisory lock for one sync pairing.
+
+    Prevents a manual ``hermes kanban sync once`` from interleaving with
+    the gateway watcher's tick on the same pairing (each write is its own
+    transaction, so interleaved runs could double-import cards or
+    double-push comments).
+
+    Returns a handle to pass to :func:`release_pairing_lock`, ``None``
+    when another process holds the lock (caller must skip the sync), or
+    the sentinel ``"no-lock"`` when locking is unavailable on this
+    platform/filesystem (caller proceeds on config discipline alone).
+    """
+    try:
+        from gateway.status import _try_acquire_file_lock
+    except ImportError:
+        return "no-lock"
+    path = _pairing_lock_path(board, provider, remote_board_ref)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle = open(path, "a+", encoding="utf-8")
+    except OSError:
+        return "no-lock"
+    if not _try_acquire_file_lock(handle):
+        handle.close()
+        return None
+    return handle
+
+
+def release_pairing_lock(handle) -> None:
+    if handle is None or handle == "no-lock":
+        return
+    try:
+        from gateway.status import _release_file_lock
+        _release_file_lock(handle)
+    except Exception:
+        pass
+    try:
+        handle.close()
+    except Exception:
+        pass

@@ -31,6 +31,7 @@ and re-appended when importing.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import sqlite3
 import time
@@ -44,6 +45,7 @@ from hermes_cli.kanban_sync.provider import (
     RemoteCard,
     SyncAuthError,
     SyncNotFoundError,
+    SyncProviderError,
     SyncRateLimitError,
 )
 
@@ -81,6 +83,16 @@ class SyncStats:
             self.updated_remote, self.comments_in, self.comments_out,
             self.conflicts, self.errors,
         ))
+
+
+@dataclass
+class _ApplyResult:
+    """What one reconcile/push helper actually did — feeds accurate stats
+    and the remote-fingerprint bookkeeping."""
+
+    local_changed: bool = False
+    remote_wrote: bool = False
+    applied_location: "Optional[dict]" = None
 
 
 class KanbanSyncEngine:
@@ -130,6 +142,20 @@ class KanbanSyncEngine:
 
     def sync_once(self, *, full: bool = False) -> SyncStats:
         stats = SyncStats()
+        lock = state.acquire_pairing_lock(
+            board=self.board,
+            provider=self.provider.name,
+            remote_board_ref=self.remote_board_ref,
+        )
+        if lock is None:
+            # A concurrent run (gateway watcher vs. manual `sync once`)
+            # holds this pairing; interleaving two full pipelines would
+            # double-import cards and double-push comments.
+            stats.errors.append(
+                f"pairing {self.provider.name}:{self.remote_board_ref} is "
+                f"busy (another sync in progress); skipped"
+            )
+            return stats
         conn = kb.connect(board=self.board)
         pairing: Optional[dict] = None
         try:
@@ -154,6 +180,7 @@ class KanbanSyncEngine:
             stats.pulled = len(cards)
 
             handled: "set[str]" = set()
+            failed_cursors: "list[Optional[str]]" = []
             for card in cards:
                 try:
                     self._reconcile_remote_card(
@@ -167,6 +194,7 @@ class KanbanSyncEngine:
                         card.ref, exc, exc_info=True,
                     )
                     stats.errors.append(f"card {card.ref}: {exc}")
+                    failed_cursors.append(card.last_active_at)
 
             if full:
                 seen_refs = {c.ref for c in cards}
@@ -175,9 +203,18 @@ class KanbanSyncEngine:
             self._export_unlinked_tasks(conn, pairing, topology, stats)
             self._push_local_changes(conn, pairing, topology, stats, handled)
 
+            # Hold the cursor back to the oldest FAILED card so the next
+            # pull re-lists it; advancing past a failed reconcile would
+            # drop that card's remote change until the next full rescan.
+            effective_cursor = new_cursor
+            if failed_cursors:
+                if any(c is None for c in failed_cursors):
+                    effective_cursor = pairing.get("remote_cursor")
+                else:
+                    effective_cursor = min(failed_cursors)
             state.update_pairing(
                 conn, pairing["id"],
-                remote_cursor=new_cursor,
+                remote_cursor=effective_cursor,
                 last_synced_at=int(time.time()),
                 last_error="; ".join(stats.errors[:5]) or None,
             )
@@ -192,6 +229,7 @@ class KanbanSyncEngine:
             raise
         finally:
             conn.close()
+            state.release_pairing_lock(lock)
         return stats
 
     # -- topology ------------------------------------------------------------
@@ -243,9 +281,14 @@ class KanbanSyncEngine:
         parts = [p for p in (body_text.strip("\n"), self._footer(url) if url else "") if p]
         return "\n\n".join(parts)
 
-    def _strip_footer(self, body: str) -> str:
+    def _strip_footer(self, body: str, url: str) -> str:
+        """Remove the trailing counterpart footer — but only the EXACT
+        footer for this card's URL. A user-written last line that merely
+        looks footer-shaped (starts with ``[fizzy] ``) is content and must
+        survive the round trip."""
         lines = (body or "").rstrip("\n").splitlines()
-        if lines and lines[-1].startswith(f"[{self.provider.name}] "):
+        footer = self._footer(url) if url else None
+        if footer and lines and lines[-1] == footer:
             lines = lines[:-1]
             while lines and not lines[-1].strip():
                 lines.pop()
@@ -320,10 +363,16 @@ class KanbanSyncEngine:
         if task is None:
             self._handle_local_delete(conn, pairing, link)
             return
+        # Snapshot BEFORE any engine action: paths that make no local
+        # writes must fingerprint this state, not a post-network re-read
+        # that would absorb concurrent worker/dashboard writes as
+        # "already synced" (lost updates).
+        task_snapshot = task
+        event_snapshot = self._max_event_id(conn, task.id)
 
         remote_changed = self._remote_fp(card) != link["remote_fingerprint"]
         local_changed = self._local_fp(task) != link["local_fingerprint"]
-        remote_dirty = False
+        result = _ApplyResult()
 
         if remote_changed and local_changed:
             stats.conflicts += 1
@@ -335,36 +384,48 @@ class KanbanSyncEngine:
                 "card": card.ref,
                 "provider": self.provider.name,
             })
+            event_snapshot = self._max_event_id(conn, task.id)
             if terminal:
                 # Worker outcome wins on status; remote wins on words.
-                self._apply_remote_fields(conn, task, card)
-                task = kb.get_task(conn, task.id)
-                remote_dirty |= self._move_card_to_status(
-                    conn, pairing, topology, card, task.status,
-                )
-                stats.updated_local += 1
-                stats.updated_remote += 1
+                result.local_changed |= self._apply_remote_fields(conn, task, card)
+                task_snapshot = kb.get_task(conn, task.id)
+                if task_snapshot is not None:
+                    loc = self._move_card_to_status(
+                        conn, pairing, topology, card, task_snapshot.status,
+                    )
+                    if loc is not None:
+                        result.remote_wrote = True
+                        result.applied_location = loc
             else:
-                remote_dirty |= self._apply_remote_to_local(
+                result = self._apply_remote_to_local(
                     conn, pairing, topology, card, task,
                 )
-                stats.updated_local += 1
+                task_snapshot = kb.get_task(conn, task.id)
+                event_snapshot = self._max_event_id(conn, task.id)
         elif remote_changed:
-            remote_dirty |= self._apply_remote_to_local(
+            result = self._apply_remote_to_local(
                 conn, pairing, topology, card, task,
             )
-            stats.updated_local += 1
+            task_snapshot = kb.get_task(conn, task.id)
+            event_snapshot = self._max_event_id(conn, task.id)
         elif local_changed:
-            remote_dirty |= self._push_local_to_remote(
+            result = self._push_local_to_remote(
                 conn, pairing, topology, card, task,
             )
+
+        if result.local_changed:
+            stats.updated_local += 1
+        if result.remote_wrote:
             stats.updated_remote += 1
 
         comments_out = self._sync_comments(conn, pairing, card.ref, task.id, stats)
-        remote_dirty |= comments_out > 0
         self._finalize_link(
             conn, pairing, task.id, card.ref,
-            remote_dirty=remote_dirty, fallback_card=card,
+            remote_dirty=result.remote_wrote or comments_out > 0,
+            fallback_card=card,
+            task_snapshot=task_snapshot,
+            event_snapshot=event_snapshot,
+            applied_location=result.applied_location,
         )
 
     def _intake_allows(self, card: RemoteCard, topology: "dict[str, str]") -> bool:
@@ -402,6 +463,10 @@ class KanbanSyncEngine:
             golden_priority = int(self.cfg.get("golden_priority", 2))
         except (TypeError, ValueError):
             golden_priority = 2
+        # Idempotency key ties the card ref to at most one live task: a
+        # crash between create_task and the link write (two separate
+        # transactions) re-imports on the next tick and gets the SAME
+        # task back instead of a duplicate.
         task_id = kb.create_task(
             conn,
             title=card.title.strip() or "(untitled card)",
@@ -410,6 +475,10 @@ class KanbanSyncEngine:
             priority=golden_priority if card.golden else 0,
             triage=True,
             created_by="fizzy-sync",
+            idempotency_key=(
+                f"kanban-sync:{self.provider.name}:"
+                f"{self.remote_board_ref}:{card.ref}"
+            ),
         )
         state.upsert_link(
             conn, pairing["id"],
@@ -418,11 +487,15 @@ class KanbanSyncEngine:
         target = self._status_for_location(card, topology)
         if target and target != "triage":
             task = kb.get_task(conn, task_id)
-            self._apply_status(conn, task, target)
+            if task is not None:
+                self._apply_status(conn, task, target)
+        task_snapshot = kb.get_task(conn, task_id)
+        event_snapshot = self._max_event_id(conn, task_id)
         self._sync_comments(conn, pairing, card.ref, task_id, stats)
         self._finalize_link(
             conn, pairing, task_id, card.ref,
             remote_dirty=False, fallback_card=card,
+            task_snapshot=task_snapshot, event_snapshot=event_snapshot,
         )
         stats.created_local += 1
         return task_id
@@ -434,31 +507,50 @@ class KanbanSyncEngine:
         topology: "dict[str, str]",
         card: RemoteCard,
         task,
-    ) -> bool:
-        """Apply remote title/body/status to the local task. Returns True
-        when local truth had to be pushed back (refused transition)."""
-        self._apply_remote_fields(conn, task, card)
-        target = self._status_for_location(card, topology)
+    ) -> _ApplyResult:
+        """Apply remote title/body/status to the local task."""
+        result = _ApplyResult()
+        result.local_changed |= self._apply_remote_fields(conn, task, card)
         task = kb.get_task(conn, task.id)
-        remote_dirty = False
-        if target and task.status != target:
+        if task is None:
+            # Deleted concurrently; the delete path picks it up next tick.
+            return result
+        target = self._status_for_location(card, topology)
+        # Only re-derive status when the card's location actually
+        # DISAGREES with where the local status maps: statuses that share
+        # a column (blocked/scheduled -> Blocked) must not collapse into
+        # each other on a purely textual remote edit.
+        card_location = {
+            "column_ref": card.column_ref,
+            "closed": card.closed,
+            "archived": card.archived,
+        }
+        local_location = self._location_for_status(
+            conn, pairing, topology, task.status,
+        )
+        if target and task.status != target and card_location != local_location:
             actual = self._apply_status(conn, task, target)
+            result.local_changed |= actual != task.status
             if actual != target:
                 # Transition refused (e.g. dependency-gated ready) —
                 # reflect local truth back on the board immediately.
-                remote_dirty = self._move_card_to_status(
+                loc = self._move_card_to_status(
                     conn, pairing, topology, card, actual,
                 )
-        return remote_dirty
+                if loc is not None:
+                    result.remote_wrote = True
+                    result.applied_location = loc
+        return result
 
-    def _apply_remote_fields(self, conn: sqlite3.Connection, task, card: RemoteCard) -> None:
+    def _apply_remote_fields(self, conn: sqlite3.Connection, task, card: RemoteCard) -> bool:
         desired_title = card.title.strip() or task.title
         desired_body = self._compose_body(card.body_text, card.url)
         title = desired_title if desired_title != task.title else None
         body = desired_body if desired_body != (task.body or "") else None
         if title is None and body is None:
-            return
+            return False
         self._edit_task_fields(conn, task.id, title=title, body=body)
+        return True
 
     def _apply_status(self, conn: sqlite3.Connection, task, target: str) -> str:
         """Move a task to ``target`` using the structured verbs where they
@@ -543,30 +635,56 @@ class KanbanSyncEngine:
         card = self.provider.create_card(
             self.remote_board_ref,
             title=task.title,
-            body_text=self._strip_footer(task.body or ""),
+            # Never-synced body carries no footer; send it verbatim.
+            body_text=task.body or "",
         )
-        location = self._location_for_status(conn, pairing, topology, task.status)
-        if location != {"column_ref": None, "closed": False, "archived": False}:
-            self.provider.move_card(card.ref, **location)
+        # Persist the link IMMEDIATELY: if any later step fails, the task
+        # must not be re-exported (one new card per tick) nor the created
+        # card re-imported as a duplicate task. The remote fingerprint
+        # records the card as created; local_fingerprint stays NULL so the
+        # push path treats the task as changed and retries the move/edit
+        # next tick. (Residual: a crash between create_card and this write
+        # can still orphan one card — a window of one HTTP call.)
         state.upsert_link(
             conn, pairing["id"],
             task_id=task_id, remote_card_ref=card.ref, origin="local",
+            remote_fingerprint=self._remote_fp(card),
+            remote_etag=card.last_active_at,
         )
         # Stamp the counterpart footer on the local body so both sides
         # carry the link and body fingerprints stay symmetric.
         if card.url:
             body = task.body or ""
-            if self._strip_footer(body) == body.rstrip("\n"):
+            footer = self._footer(card.url)
+            if not body.rstrip("\n").endswith(footer):
                 self._edit_task_fields(
                     conn, task_id,
-                    body=self._compose_body(self._strip_footer(body), card.url),
+                    body=self._compose_body(body, card.url),
                 )
-        self._sync_comments(conn, pairing, card.ref, task_id, stats)
-        self._finalize_link(
-            conn, pairing, task_id, card.ref,
-            remote_dirty=True, fallback_card=card,
-        )
         stats.created_remote += 1
+        try:
+            task_snapshot = kb.get_task(conn, task_id)
+            event_snapshot = self._max_event_id(conn, task_id)
+            applied = self._move_card_to_status(
+                conn, pairing, topology, card, task.status,
+            )
+            self._sync_comments(conn, pairing, card.ref, task_id, stats)
+            self._finalize_link(
+                conn, pairing, task_id, card.ref,
+                remote_dirty=True, fallback_card=card,
+                task_snapshot=task_snapshot, event_snapshot=event_snapshot,
+                applied_location=applied,
+            )
+        except (SyncAuthError, SyncRateLimitError):
+            raise
+        except Exception as exc:
+            # Link already persisted: the push path retries the move and
+            # comments next tick (local_fingerprint is still NULL).
+            logger.warning(
+                "kanban-sync: post-create export steps for %s failed: %s",
+                task_id, exc, exc_info=True,
+            )
+            stats.errors.append(f"task {task_id}: {exc}")
 
     def _push_local_changes(
         self,
@@ -606,22 +724,30 @@ class KanbanSyncEngine:
         new_comments = self._max_comment_id(conn, task.id) > link["last_local_comment_id"]
         if not local_changed and not new_comments:
             return
+        # Snapshot before network I/O: this is the state being pushed and
+        # therefore the state that may be marked "synced".
+        task_snapshot = task
+        event_snapshot = self._max_event_id(conn, task.id)
         try:
             card = self.provider.get_card(link["remote_card_ref"])
         except SyncNotFoundError:
             self._handle_remote_delete(conn, pairing, link, task)
             return
-        remote_dirty = False
+        result = _ApplyResult()
         if local_changed:
-            remote_dirty |= self._push_local_to_remote(
+            result = self._push_local_to_remote(
                 conn, pairing, topology, card, task,
             )
-            stats.updated_remote += 1
+            if result.remote_wrote:
+                stats.updated_remote += 1
         comments_out = self._sync_comments(conn, pairing, card.ref, task.id, stats)
-        remote_dirty |= comments_out > 0
         self._finalize_link(
             conn, pairing, task.id, card.ref,
-            remote_dirty=remote_dirty, fallback_card=card,
+            remote_dirty=result.remote_wrote or comments_out > 0,
+            fallback_card=card,
+            task_snapshot=task_snapshot,
+            event_snapshot=event_snapshot,
+            applied_location=result.applied_location,
         )
 
     def _push_local_to_remote(
@@ -631,17 +757,20 @@ class KanbanSyncEngine:
         topology: "dict[str, str]",
         card: RemoteCard,
         task,
-    ) -> bool:
-        dirty = False
+    ) -> _ApplyResult:
+        result = _ApplyResult()
         desired_title = task.title
-        desired_body = self._strip_footer(task.body or "")
+        desired_body = self._strip_footer(task.body or "", card.url)
         title = desired_title if desired_title != card.title else None
         body = desired_body if desired_body != card.body_text else None
         if title is not None or body is not None:
             self.provider.update_card(card.ref, title=title, body_text=body)
-            dirty = True
-        dirty |= self._move_card_to_status(conn, pairing, topology, card, task.status)
-        return dirty
+            result.remote_wrote = True
+        loc = self._move_card_to_status(conn, pairing, topology, card, task.status)
+        if loc is not None:
+            result.remote_wrote = True
+            result.applied_location = loc
+        return result
 
     def _move_card_to_status(
         self,
@@ -650,7 +779,14 @@ class KanbanSyncEngine:
         topology: "dict[str, str]",
         card: RemoteCard,
         status: str,
-    ) -> bool:
+    ) -> "Optional[dict]":
+        """Move the card to the location mapping ``status``. Returns the
+        applied location dict when a move was issued, ``None`` on no-op.
+
+        A first failure retries ONCE with force-refreshed topology: the
+        cached column id may be stale (a human deleted/recreated the
+        column remotely), and looping on the stale ref would create a
+        duplicate card per tick via the export path."""
         location = self._location_for_status(conn, pairing, topology, status)
         current = {
             "column_ref": card.column_ref,
@@ -658,9 +794,18 @@ class KanbanSyncEngine:
             "archived": card.archived,
         }
         if current == location:
-            return False
-        self.provider.move_card(card.ref, **location)
-        return True
+            return None
+        try:
+            self.provider.move_card(card.ref, **location)
+        except (SyncAuthError, SyncRateLimitError):
+            raise
+        except SyncProviderError:
+            refreshed = self._ensure_topology(conn, pairing, force=True)
+            topology.clear()
+            topology.update(refreshed)
+            location = self._location_for_status(conn, pairing, topology, status)
+            self.provider.move_card(card.ref, **location)
+        return location
 
     # -- comments ------------------------------------------------------------
 
@@ -679,53 +824,78 @@ class KanbanSyncEngine:
         if link is None:
             return 0
 
-        # Remote -> local. The pushed/seen ledger — not authorship — is
-        # what identifies our own comments, because providers attribute
-        # everything to the token's user.
         last_remote_ref = link["last_remote_comment_ref"]
-        for comment in self.provider.list_comments(
-            card_ref, since_ref=last_remote_ref,
-        ):
-            last_remote_ref = comment.ref
-            if state.is_pushed_comment(conn, pid, comment.ref):
-                continue
-            local_id = kb.add_comment(
-                conn, task_id,
-                author=f"fizzy:{comment.author or 'unknown'}",
-                body=comment.body_text,
-            )
-            state.record_pushed_comment(
-                conn, pid, remote_comment_ref=comment.ref,
-                task_id=task_id, local_comment_id=local_id,
-            )
-            stats.comments_in += 1
-
-        # Local -> remote. Imported comments carry the fizzy: author
-        # prefix and are skipped; everything else rides with provenance.
-        pushed = 0
         last_local_id = link["last_local_comment_id"]
-        for comment in kb.list_comments(conn, task_id):
-            if comment.id <= last_local_id:
-                continue
-            last_local_id = max(last_local_id, comment.id)
-            if str(comment.author or "").startswith("fizzy:"):
-                continue
-            ref = self.provider.add_comment(
-                card_ref,
-                f"[hermes:{comment.author or 'unknown'}] {comment.body}",
-            )
-            state.record_pushed_comment(
-                conn, pid, remote_comment_ref=ref,
-                task_id=task_id, local_comment_id=comment.id,
-            )
-            stats.comments_out += 1
-            pushed += 1
+        pushed = 0
+        try:
+            # Remote -> local. The seen-comment ledger — not authorship or
+            # cursor position — identifies comments the engine already
+            # handled, because providers attribute everything to the
+            # token's user and cursors can be lost.
+            for comment in self.provider.list_comments(
+                card_ref, since_ref=last_remote_ref,
+            ):
+                if not state.is_pushed_comment(conn, pid, comment.ref):
+                    # Image/attachment-only comments normalize to empty
+                    # text; kb.add_comment rejects empty bodies, and a
+                    # skipped-but-unledgered comment would wedge the
+                    # cursor. Import a placeholder instead.
+                    body = comment.body_text
+                    if not body.strip():
+                        body = "[non-text comment]"
+                    local_id = kb.add_comment(
+                        conn, task_id,
+                        author=f"fizzy:{comment.author or 'unknown'}",
+                        body=body,
+                    )
+                    state.record_pushed_comment(
+                        conn, pid, remote_comment_ref=comment.ref,
+                        task_id=task_id, local_comment_id=local_id,
+                    )
+                    stats.comments_in += 1
+                last_remote_ref = comment.ref
 
-        state.update_link(
-            conn, pid, task_id,
-            last_remote_comment_ref=last_remote_ref,
-            last_local_comment_id=last_local_id,
-        )
+            # Local -> remote. The ledger also records each import's local
+            # rowid, so imported comments are skipped here by ledger
+            # lookup — never by author-prefix heuristics (a genuine local
+            # author named fizzy:* must still sync out).
+            for comment in kb.list_comments(conn, task_id):
+                if comment.id <= last_local_id:
+                    continue
+                if state.is_local_comment_pushed(conn, pid, task_id, comment.id):
+                    last_local_id = max(last_local_id, comment.id)
+                    continue
+                try:
+                    ref = self.provider.add_comment(
+                        card_ref,
+                        f"[hermes:{comment.author or 'unknown'}] {comment.body}",
+                    )
+                except (SyncAuthError, SyncRateLimitError):
+                    raise
+                except SyncProviderError as exc:
+                    # Poison/transient rejection: stop here (preserves
+                    # order), keep the cursor pointing before this comment
+                    # and retry next tick. The ledger protects everything
+                    # already pushed from being duplicated.
+                    stats.errors.append(
+                        f"comment {comment.id} on {task_id}: {exc}"
+                    )
+                    break
+                state.record_pushed_comment(
+                    conn, pid, remote_comment_ref=ref,
+                    task_id=task_id, local_comment_id=comment.id,
+                )
+                stats.comments_out += 1
+                pushed += 1
+                last_local_id = max(last_local_id, comment.id)
+        finally:
+            # Persist whatever progress was made — a mid-loop failure must
+            # not rewind the cursors past already-handled comments.
+            state.update_link(
+                conn, pid, task_id,
+                last_remote_comment_ref=last_remote_ref,
+                last_local_comment_id=last_local_id,
+            )
         return pushed
 
     # -- deletes ---------------------------------------------------------------
@@ -798,23 +968,44 @@ class KanbanSyncEngine:
         *,
         remote_dirty: bool,
         fallback_card: RemoteCard,
+        task_snapshot,
+        event_snapshot: int,
+        applied_location: "Optional[dict]" = None,
     ) -> None:
         """Store post-write fingerprints so the next poll no-ops on our
-        own writes — the heart of echo suppression."""
+        own writes — the heart of echo suppression.
+
+        ``task_snapshot``/``event_snapshot`` are the local state as of the
+        engine's last LOCAL write (or the pre-reconcile read when it made
+        none). Fingerprinting a fresh re-read here would silently absorb
+        anything a worker/dashboard committed during the network I/O —
+        including terminal outcomes — as "already synced".
+
+        ``applied_location`` overrides the location fields of the fetched
+        card: providers whose single-card payload can't express archived
+        state (Fizzy without ``postponed``) would otherwise store a
+        fingerprint that disagrees with the next listing sweep, creating
+        phantom remote changes."""
         card = fallback_card
         if remote_dirty:
             try:
                 card = self.provider.get_card(card_ref)
             except SyncNotFoundError:
                 pass
-        task = kb.get_task(conn, task_id)
+        if applied_location is not None:
+            card = dataclasses.replace(
+                card,
+                column_ref=applied_location["column_ref"],
+                closed=applied_location["closed"],
+                archived=applied_location["archived"],
+            )
         fields: dict = {
             "remote_etag": card.last_active_at,
             "remote_fingerprint": self._remote_fp(card),
-            "last_local_event_id": self._max_event_id(conn, task_id),
+            "last_local_event_id": event_snapshot,
         }
-        if task is not None:
-            fields["local_fingerprint"] = self._local_fp(task)
+        if task_snapshot is not None:
+            fields["local_fingerprint"] = self._local_fp(task_snapshot)
         state.update_link(conn, pairing["id"], task_id, **fields)
 
     # -- small local helpers -------------------------------------------------

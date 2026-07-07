@@ -509,3 +509,243 @@ def test_append_task_event_public_wrapper(kanban_home):
         events = kb.list_events(conn, tid)
         assert events[-1].kind == "sync_conflict"
         assert events[-1].payload == {"winner": "remote"}
+
+
+# ---------------------------------------------------------------------------
+# Review-driven robustness (adversarial review findings)
+# ---------------------------------------------------------------------------
+
+from hermes_cli.kanban_sync.provider import SyncProviderError  # noqa: E402
+
+
+def test_export_move_failure_links_first_and_retries(provider):
+    """A transient move failure must not orphan the created card: the link
+    is persisted right after create_card, so the next tick retries the
+    move instead of creating duplicate cards/tasks forever."""
+    engine = make_engine(provider)
+    engine.sync_once()
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="flaky export")
+    # Two injected failures: the engine retries a failed move once with
+    # refreshed topology, so both attempts must fail to defer the move.
+    provider.fail_ops["move_card"] = [
+        SyncProviderError("transient 500"), SyncProviderError("transient 500"),
+    ]
+    stats1 = engine.sync_once()
+    assert stats1.errors, "move failure should be recorded"
+    assert len(provider.cards) == 1, "exactly one remote card"
+    with kb.connect() as conn:
+        pairing = state.list_pairings(conn)[0]
+        assert state.get_link_by_task(conn, pairing["id"], tid) is not None
+    engine.sync_once()  # retries the move via the push path
+    ref = next(iter(provider.cards))
+    assert provider.column_name_of(ref) == "Ready"
+    with kb.connect() as conn:
+        tasks = kb.list_tasks(conn, include_archived=True)
+        assert len(tasks) == 1, "no duplicate local task imported"
+    assert len(provider.cards) == 1
+    assert_quiescent(engine, provider)
+
+
+def test_export_move_retries_with_refreshed_topology(provider):
+    """A remotely-deleted mapped column must self-heal (recreate + retry),
+    not loop creating duplicate cards against a stale cached column id."""
+    engine = make_engine(provider)
+    engine.sync_once()
+    del provider.columns["Ready"]  # human deleted the column remotely
+    with kb.connect() as conn:
+        kb.create_task(conn, title="needs healing")
+    stats = engine.sync_once()
+    assert stats.created_remote == 1
+    assert len(provider.cards) == 1
+    ref = next(iter(provider.cards))
+    assert provider.column_name_of(ref) == "Ready"  # recreated
+    assert_quiescent(engine, provider)
+
+
+def test_import_is_idempotent_after_link_loss(provider):
+    """A crash between create_task and the link write must not duplicate
+    the task on re-import (idempotency key ties card ref to task)."""
+    engine = make_engine(provider)
+    ref, tid = _import_one(engine, provider, title="crashy import")
+    with kb.connect() as conn:
+        conn.execute("DELETE FROM kanban_sync_links")
+        conn.commit()
+    provider.human_edit(ref, title="crashy import v2")  # ensure re-listed
+    engine.sync_once()
+    with kb.connect() as conn:
+        tasks = kb.list_tasks(conn, include_archived=True)
+        assert [t.id for t in tasks] == [tid], "no duplicate task"
+        pairing = state.list_pairings(conn)[0]
+        link = state.get_link_by_task(conn, pairing["id"], tid)
+        assert link is not None and link["remote_card_ref"] == ref
+    assert_quiescent(engine, provider)
+
+
+def test_concurrent_local_completion_during_reconcile_not_absorbed(provider):
+    """A worker completing the task while the engine is mid-reconcile
+    (during comment I/O) must be pushed on the next tick, not fingerprinted
+    away as already-synced."""
+    engine = make_engine(provider)
+    ref, tid = _import_one(engine, provider, title="raced", column_name="Ready")
+    with kb.connect() as conn:
+        kb.claim_task(conn, tid)
+    engine.sync_once()
+
+    def complete_mid_flight(card_ref):
+        provider.hooks.pop("list_comments", None)  # fire once
+        with kb.connect() as c2:
+            assert kb.complete_task(c2, tid, summary="done mid-flight")
+
+    provider.hooks["list_comments"] = complete_mid_flight
+    provider.human_edit(ref, title="raced v2")
+    engine.sync_once()  # applies the title; completion lands mid-tick
+    engine.sync_once()  # must push the completion
+    assert provider.cards[ref]["closed"] is True
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "done"
+    assert_quiescent(engine, provider)
+
+
+def test_partial_comment_push_failure_never_duplicates(provider):
+    """The pushed-comment ledger must make the outbound leg idempotent:
+    a poison comment aborting the loop cannot re-push its predecessor."""
+    engine = make_engine(provider)
+    ref, tid = _import_one(engine, provider, title="chat")
+    with kb.connect() as conn:
+        kb.add_comment(conn, tid, author="me", body="first note")
+        kb.add_comment(conn, tid, author="me", body="POISON payload")
+    provider.poison_comment_bodies.add("POISON")
+    stats1 = engine.sync_once()
+    assert stats1.errors
+    stats2 = engine.sync_once()  # retries poison, must not re-push 'first'
+    assert stats2.errors
+    provider.poison_comment_bodies.clear()
+    engine.sync_once()  # poison clears; second comment lands
+    bodies = [c.body_text for c in provider.comments[ref]]
+    assert len([b for b in bodies if "first note" in b]) == 1
+    assert len([b for b in bodies if "POISON" in b]) == 1
+    assert bodies.index("[hermes:me] first note") < bodies.index(
+        "[hermes:me] POISON payload"
+    )
+    assert_quiescent(engine, provider)
+
+
+def test_empty_remote_comment_imports_placeholder(provider):
+    """Image/attachment-only comments normalize to empty text; they must
+    import as a placeholder instead of wedging the comment cursor."""
+    engine = make_engine(provider)
+    ref, tid = _import_one(engine, provider, title="pics")
+    provider.human_comment(ref, "doc", "")
+    provider.human_comment(ref, "doc", "and a caption")
+    engine.sync_once()
+    with kb.connect() as conn:
+        bodies = [c.body for c in kb.list_comments(conn, tid)]
+    assert "[non-text comment]" in bodies
+    assert "and a caption" in bodies
+    assert_quiescent(engine, provider)
+
+
+def test_local_comment_with_fizzy_author_prefix_is_pushed(provider):
+    """Outbound dedup must use the ledger, not author-string heuristics:
+    a genuine local comment by an author named fizzy:* still syncs."""
+    engine = make_engine(provider)
+    ref, tid = _import_one(engine, provider, title="ops")
+    with kb.connect() as conn:
+        kb.add_comment(conn, tid, author="fizzy:automation", body="ops note")
+    engine.sync_once()
+    pushed = [w for w in provider.writes if w[0] == "add_comment"]
+    assert ["[hermes:fizzy:automation] ops note"] == [w[2] for w in pushed]
+    assert_quiescent(engine, provider)
+
+
+def test_failed_reconcile_holds_cursor_for_retry(provider):
+    """A per-card reconcile failure must not let the cursor skip past that
+    card's change forever."""
+    engine = make_engine(provider)
+    engine.sync_once()
+    ref1 = provider.human_add_card(title="one")
+    ref2 = provider.human_add_card(title="two")
+    engine.sync_once()
+    provider.human_edit(ref1, title="one v2")
+    provider.human_edit(ref2, title="two v2")
+    provider.fail_ops["list_comments"] = [SyncProviderError("boom")]
+    stats1 = engine.sync_once()
+    assert stats1.errors
+    stats2 = engine.sync_once()  # failed card must be re-pulled
+    assert not stats2.errors
+    with kb.connect() as conn:
+        titles = {t.title for t in kb.list_tasks(conn, include_archived=True)}
+    assert {"one v2", "two v2"} <= titles
+    assert_quiescent(engine, provider)
+
+
+def test_remote_title_edit_keeps_scheduled_status(provider):
+    """blocked and scheduled share a column; a remote edit that does not
+    move the card must not collapse scheduled into blocked."""
+    engine = make_engine(provider)
+    ref, tid = _import_one(engine, provider, title="backoff",
+                           column_name="Ready")
+    with kb.connect() as conn:
+        kb.claim_task(conn, tid)
+        assert kb.schedule_task(conn, tid, reason="rate limited")
+    engine.sync_once()  # pushes card into the Blocked column
+    assert provider.column_name_of(ref) == "Blocked"
+    provider.human_edit(ref, title="backoff (typo fixed)")
+    engine.sync_once()
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+        assert task.status == "scheduled", "typo fix must not re-block"
+        assert task.title == "backoff (typo fixed)"
+    assert_quiescent(engine, provider)
+
+
+def test_archive_unarchive_roundtrip_without_phantom_changes(provider):
+    """Even when the provider's get_card cannot express the archived
+    state, the stored fingerprint must reflect the location the engine
+    just applied — otherwise every archive push manufactures a phantom
+    remote change (and false conflicts) on the next pull."""
+    provider.get_card_hides_archived = True
+    engine = make_engine(provider)
+    ref, tid = _import_one(engine, provider, title="parkable")
+    with kb.connect() as conn:
+        kb.archive_task(conn, tid)
+    engine.sync_once()
+    assert provider.cards[ref]["archived"] is True
+    assert_quiescent(engine, provider)
+    with kb.connect() as conn:
+        kb.set_status_direct(conn, tid, "todo", source="test")
+    engine.sync_once()
+    assert provider.cards[ref]["archived"] is False
+    assert provider.column_name_of(ref) == "Todo"
+    assert_quiescent(engine, provider)
+
+
+def test_priority_only_change_reports_no_remote_update(provider):
+    engine = make_engine(provider)
+    ref, tid = _import_one(engine, provider, title="prio")
+    with kb.connect() as conn:
+        conn.execute("UPDATE tasks SET priority = 5 WHERE id = ?", (tid,))
+        conn.commit()
+    writes_before = list(provider.writes)
+    stats = engine.sync_once()
+    assert provider.writes == writes_before
+    assert stats.updated_remote == 0
+    assert_quiescent(engine, provider)
+
+
+def test_sync_once_skips_when_pairing_locked(provider):
+    engine = make_engine(provider)
+    engine.sync_once()  # creates pairing/topology
+    handle = state.acquire_pairing_lock(
+        board=None, provider="fake", remote_board_ref=BOARD_REF,
+    )
+    assert handle is not None
+    try:
+        writes_before = list(provider.writes)
+        stats = engine.sync_once()
+        assert provider.writes == writes_before
+        assert any("another sync" in e for e in stats.errors)
+    finally:
+        state.release_pairing_lock(handle)
+    engine.sync_once()  # lock released: works again
