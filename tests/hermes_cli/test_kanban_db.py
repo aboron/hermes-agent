@@ -4766,3 +4766,66 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+# ---------------------------------------------------------------------------
+# set_status_direct (lifted from the dashboard plugin; used by kanban-sync)
+# ---------------------------------------------------------------------------
+
+def test_set_status_direct_updates_status_and_appends_event(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="direct")
+        assert kb.set_status_direct(conn, tid, "todo", source="test-suite")
+        assert kb.get_task(conn, tid).status == "todo"
+        status_events = [
+            e for e in kb.list_events(conn, tid) if e.kind == "status"
+        ]
+        assert status_events, "expected a status event row"
+        assert status_events[-1].payload["status"] == "todo"
+        assert status_events[-1].payload["source"] == "test-suite"
+
+
+def test_set_status_direct_unknown_task_returns_false(kanban_home):
+    with kb.connect() as conn:
+        assert kb.set_status_direct(conn, "t_missing", "todo") is False
+
+
+def test_set_status_direct_rejects_invalid_status(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="direct")
+        with pytest.raises(ValueError):
+            kb.set_status_direct(conn, tid, "bogus")
+
+
+def test_set_status_direct_guards_ready_promotion_on_parents(kanban_home):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent")
+        child = kb.create_task(conn, title="child", parents=(parent,))
+        assert kb.get_task(conn, child).status == "todo"
+        assert kb.set_status_direct(conn, child, "ready") is False
+        assert kb.get_task(conn, child).status == "todo"
+
+
+def test_set_status_direct_off_running_closes_run_as_reclaimed(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="worker", assignee="prof")
+        assert kb.claim_task(conn, tid) is not None
+        assert kb.get_task(conn, tid).status == "running"
+        assert kb.set_status_direct(conn, tid, "ready", source="kanban-sync")
+        run = kb.latest_run(conn, tid)
+        assert run is not None
+        assert run.outcome == "reclaimed"
+        assert "kanban-sync" in (run.summary or "")
+
+
+def test_set_status_direct_reopening_done_parent_demotes_ready_children(kanban_home):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent")
+        child = kb.create_task(conn, title="child", parents=(parent,))
+        assert kb.claim_task(conn, parent) is not None
+        assert kb.complete_task(conn, parent, summary="done")
+        kb.recompute_ready(conn)
+        assert kb.get_task(conn, child).status == "ready"
+        # Reopen the parent: child must fall back to todo.
+        assert kb.set_status_direct(conn, parent, "todo")
+        assert kb.get_task(conn, child).status == "todo"
