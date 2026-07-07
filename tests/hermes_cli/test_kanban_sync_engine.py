@@ -795,3 +795,23 @@ def test_remote_card_title_newlines_are_collapsed(provider):
     with kb.connect() as conn:
         assert "\n" not in _single_task(conn).title
     assert_quiescent(engine, provider)
+
+
+def test_footer_lookalike_user_line_survives_roundtrip(provider):
+    """A user-written line that merely looks footer-shaped is content:
+    only the exact footer for this card's URL may be stripped."""
+    engine = make_engine(provider)
+    engine.sync_once()
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="notes",
+            body="Deploy notes\n[fake] see card 42 for rollback",
+        )
+    engine.sync_once()
+    ref = next(iter(provider.cards))
+    assert "[fake] see card 42 for rollback" in provider.cards[ref]["body_text"]
+    with kb.connect() as conn:
+        body = kb.get_task(conn, tid).body
+        assert "[fake] see card 42 for rollback" in body
+        assert body.rstrip().endswith(f"[fake] fake://cards/{ref}")
+    assert_quiescent(engine, provider)

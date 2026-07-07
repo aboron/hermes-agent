@@ -152,7 +152,9 @@ comment on the card and unlinks it.
 - **Multi-gateway**: only one gateway machine-wide may run the sync — a
   `.sync.lock` advisory lock (same backstop as the dispatcher's
   `.dispatcher.lock`) refuses a second concurrent syncer, which would
-  otherwise fight over cursors.
+  otherwise fight over cursors. A per-pairing lock additionally stops a
+  manual `hermes kanban sync once` from interleaving with a watcher tick
+  on the same pairing (the CLI reports "busy" and exits non-zero).
 - **Failure behaviour**: per-pairing errors are logged and retried with
   jittered backoff (auth failures warn at most once per 5 minutes;
   `Retry-After` on 429s is honored). One bad card never aborts a pass —
