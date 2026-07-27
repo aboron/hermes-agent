@@ -55,7 +55,7 @@ def _listener_pids_on_port(port: int) -> list:
     try:
         result = subprocess.run(
             ["lsof", "-ti", f"tcp:{port}", "-sTCP:LISTEN"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=5,
         )
         for line in result.stdout.strip().splitlines():
             try:
@@ -70,7 +70,7 @@ def _listener_pids_on_port(port: int) -> list:
     try:
         result = subprocess.run(
             ["ss", "-ltnHp", f"sport = :{port}"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=5,
         )
         for m in re.finditer(r"pid=(\d+)", result.stdout):
             pids.append(int(m.group(1)))
@@ -88,7 +88,7 @@ def _kill_port_process(port: int) -> None:
             # Use netstat to find the PID bound to this port, then taskkill
             result = subprocess.run(
                 ["netstat", "-ano", "-p", "TCP"],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=5,
                 creationflags=windows_hide_flags(),
             )
             for line in result.stdout.splitlines():
@@ -167,7 +167,7 @@ def _kill_stale_bridge_by_pidfile(session_path: Path) -> None:
     try:
         # Format: line 1 = pid, optional line 2 = kernel start time. Legacy
         # files written before the guard existed have only the pid.
-        lines = pid_file.read_text().split("\n")
+        lines = pid_file.read_text(encoding="utf-8").split("\n")
         pid = int(lines[0].strip())
         if len(lines) > 1 and lines[1].strip():
             recorded_start = int(lines[1].strip())
@@ -208,7 +208,7 @@ def _write_bridge_pidfile(session_path: Path, pid: int) -> None:
         from gateway.status import get_process_start_time
         start = get_process_start_time(pid)
         text = str(pid) if start is None else "{}\n{}".format(pid, start)
-        (session_path / "bridge.pid").write_text(text)
+        (session_path / "bridge.pid").write_text(text, encoding="utf-8")
     except OSError:
         pass
 
@@ -223,7 +223,7 @@ def _terminate_bridge_process(proc, *, force: bool = False) -> None:
             result = subprocess.run(
                 cmd,
                 capture_output=True,
-                text=True,
+                text=True, encoding='utf-8', errors='replace',
                 timeout=10,
             )
         except FileNotFoundError:
@@ -349,7 +349,7 @@ def check_whatsapp_requirements() -> bool:
         result = subprocess.run(
             [_node, "--version"],
             capture_output=True,
-            text=True,
+            text=True, encoding='utf-8', errors='replace',
             timeout=5
         )
         return result.returncode == 0
@@ -531,7 +531,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             _deps_fresh = False
             if (bridge_dir / "node_modules").exists():
                 try:
-                    _deps_fresh = (_dep_stamp.read_text().strip() == _pkg_hash) and bool(_pkg_hash)
+                    _deps_fresh = (
+                        _dep_stamp.read_text(encoding="utf-8").strip() == _pkg_hash
+                    ) and bool(_pkg_hash)
                 except OSError:
                     _deps_fresh = False
             if not _deps_fresh:
@@ -547,7 +549,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                         [_npm_bin, "install", "--silent"],
                         cwd=str(bridge_dir),
                         capture_output=True,
-                        text=True,
+                        text=True, encoding='utf-8', errors='replace',
                         timeout=npm_install_timeout,
                         env=with_hermes_node_path(),
                     )
@@ -557,7 +559,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                     print(f"[{self.name}] Dependencies installed")
                     if _pkg_hash:
                         try:
-                            _dep_stamp.write_text(_pkg_hash)
+                            _dep_stamp.write_text(_pkg_hash, encoding="utf-8")
                         except OSError:
                             pass  # Stamp is an optimization; install still succeeded
                 except Exception as e:
@@ -1278,6 +1280,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+            profile=event.source.profile,
         )
 
     def _enqueue_text_event(self, event: MessageEvent) -> None:
@@ -1569,12 +1572,18 @@ async def _standalone_send(
     thread_id=None,
     media_files=None,
     force_document=False,
+    caption=None,
 ):
     """Out-of-process WhatsApp delivery via the local bridge HTTP API.
 
     Implements the standalone_sender_fn contract so deliver=whatsapp cron jobs
     succeed when cron runs separately from the gateway. Replaces the legacy
     _send_whatsapp helper.
+
+    When ``caption`` is provided (single-file ``MEDIA:<path> caption`` send),
+    the text rides on the media bubble's native caption via the bridge
+    ``/send-media`` ``caption`` field instead of being posted as a separate
+    ``/send`` message beforehand.
     """
     extra = getattr(pconfig, "extra", {}) or {}
     try:
@@ -1586,10 +1595,14 @@ async def _standalone_send(
         normalized_chat_id = to_whatsapp_jid(chat_id)
         media = media_files or []
         text = message or ""
+        # A caption only applies to a single media file; guard defensively so
+        # a caption is never silently repeated across a multi-file send.
+        media_caption = caption if (caption and len(media) == 1) else None
         last_message_id = None
         async with aiohttp.ClientSession() as session:
-            # 1) Text first (skip the /send call when this chunk is media-only).
-            if text.strip():
+            # 1) Text first (skip the /send call when this chunk is media-only
+            #    or when the text is delivered as the media caption instead).
+            if text.strip() and not media_caption:
                 async with session.post(
                     f"http://localhost:{bridge_port}/send",
                     json={"chatId": normalized_chat_id, "message": text},
@@ -1607,6 +1620,21 @@ async def _standalone_send(
             # bubble, and ogg/opus as a voice note — not a file/document.
             for media_path, is_voice in media:
                 if not os.path.exists(media_path):
+                    # If the text was suppressed to ride as this file's caption
+                    # (caption mode), the words would otherwise be lost when the
+                    # file is missing — deliver the caption as a plain message
+                    # so nothing silently disappears.
+                    if media_caption:
+                        try:
+                            async with session.post(
+                                f"http://localhost:{bridge_port}/send",
+                                json={"chatId": normalized_chat_id, "message": media_caption},
+                                timeout=aiohttp.ClientTimeout(total=30),
+                            ) as resp:
+                                if resp.status == 200:
+                                    last_message_id = (await resp.json()).get("messageId")
+                        except Exception:
+                            logger.warning("WhatsApp caption-fallback send failed for missing media")
                     return {"error": f"WhatsApp media file not found: {media_path}"}
                 media_type = _bridge_media_type(media_path, is_voice, force_document)
                 payload: Dict[str, Any] = {
@@ -1616,6 +1644,8 @@ async def _standalone_send(
                 }
                 if media_type == "document":
                     payload["fileName"] = os.path.basename(media_path)
+                if media_caption:
+                    payload["caption"] = media_caption
                 async with session.post(
                     f"http://localhost:{bridge_port}/send-media",
                     json=payload,
@@ -1644,7 +1674,7 @@ def interactive_setup() -> None:
     static _PLATFORMS["whatsapp"] dict. CLI helpers are lazy-imported so the
     plugin's module-load surface stays minimal.
     """
-    from hermes_cli.config import get_env_value, save_env_value
+    from hermes_cli.config import get_env_value, remove_env_value, save_env_value
     from hermes_cli.cli_output import (
         prompt,
         prompt_yes_no,
@@ -1677,9 +1707,12 @@ def interactive_setup() -> None:
         save_env_value("WHATSAPP_ALLOWED_USERS", allowed_users.replace(" ", ""))
         print_success("WhatsApp allowlist configured")
 
-    home_channel = prompt("Home chat ID for cron delivery (leave empty to skip)")
+    home_channel = prompt("Home chat ID for cron delivery (leave empty to skip)").strip()
     if home_channel:
-        save_env_value("WHATSAPP_HOME_CHANNEL", home_channel.strip())
+        save_env_value("WHATSAPP_HOME_CHANNEL", home_channel)
+    else:
+        if remove_env_value("WHATSAPP_HOME_CHANNEL"):
+            print_info("Home channel cleared.")
 
 
 def _apply_yaml_config(yaml_cfg: dict, whatsapp_cfg: dict) -> dict | None:

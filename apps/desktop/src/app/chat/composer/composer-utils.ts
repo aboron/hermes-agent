@@ -6,6 +6,12 @@ import { setSessionPickerOpen } from '@/store/session'
 
 export const COMPOSER_STACK_BREAKPOINT_PX = 320
 
+// Above the stack breakpoint but still cramped: the model pill sheds its label
+// for its chevron icon (freeing ~120px) so the controls stop crowding the input
+// before the whole row has to stack. Progressive collapse: full pill → icon
+// pill → stacked.
+export const COMPOSER_COMPACT_PILL_PX = 440
+
 // A single editor line is ~28px (--composer-input-min-height 1.625rem + 0.5rem
 // vertical padding). Anything taller means the text wrapped to a second line,
 // which is when the composer should expand to the stacked layout.
@@ -44,6 +50,9 @@ export function slashChipKindForItem(item: Unstable_TriggerItem): SlashChipKind 
   return 'command'
 }
 
+/** True for a skill completion — the only kind offered mid-message. */
+export const isSkillItem = (item: Unstable_TriggerItem) => slashChipKindForItem(item) === 'skill'
+
 /** A `/` query is at its arg stage once it's past the command name. */
 export const slashArgStage = (query: string) => query.includes(' ')
 
@@ -58,3 +67,26 @@ export interface QueueEditState {
 }
 
 export const cloneAttachments = (attachments: ComposerAttachment[]) => attachments.map(a => ({ ...a }))
+
+export interface PendingDraftPersist {
+  scope: string | null
+  text: string
+}
+
+/**
+ * Defense-in-depth for #54527: the debounce timer and the `pagehide` flush
+ * both write a captured `{ scope, text }` pair some time after it was
+ * scheduled. Before either commits the write, this checks the pair is still
+ * the one currently on file — i.e. nothing cleared or replaced it in the
+ * meantime (a session swap, a newer keystroke). The scope-capture fix
+ * upstream (`draftScopeRef`) already makes every captured pair correct by
+ * construction; this guard exists so that if a future change reintroduces a
+ * stale/live-ref read at one of these call sites, the write is dropped
+ * instead of silently filing one session's text under another session's key.
+ */
+export function isPendingDraftPersistCurrent(
+  pending: PendingDraftPersist | null,
+  expected: PendingDraftPersist | null
+): boolean {
+  return pending !== null && expected !== null && pending.scope === expected.scope && pending.text === expected.text
+}

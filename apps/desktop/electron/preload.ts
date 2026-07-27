@@ -6,7 +6,8 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   touchBackend: profile => ipcRenderer.invoke('hermes:backend:touch', profile),
   getGatewayWsUrl: profile => ipcRenderer.invoke('hermes:gateway:ws-url', profile),
   openSessionWindow: (sessionId, opts) => ipcRenderer.invoke('hermes:window:openSession', sessionId, opts),
-  openNewSessionWindow: () => ipcRenderer.invoke('hermes:window:openNewSession'),
+  openWindow: () => ipcRenderer.invoke('hermes:window:openInstance'),
+  claimAmbientCue: key => ipcRenderer.invoke('hermes:ambient:claim', key),
   petOverlay: {
     // Main renderer → main process: window lifecycle + drag. `request` is
     // `{ bounds, screen }`; resolves with the screen bounds it actually used.
@@ -35,14 +36,60 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
       return () => ipcRenderer.removeListener('hermes:pet-overlay:control', listener)
     }
   },
+  // Quick Entry: the global-hotkey mini composer window. Main owns the OS
+  // shortcut + the persisted preference; the quick window only captures text
+  // and hands it back, and the primary renderer submits it through the normal
+  // prompt path.
+  quickEntry: {
+    getSettings: () => ipcRenderer.invoke('hermes:quick-entry:settings:get'),
+    setSettings: patch => ipcRenderer.invoke('hermes:quick-entry:settings:set', patch),
+    submit: payload => ipcRenderer.send('hermes:quick-entry:submit', payload),
+    dismiss: () => ipcRenderer.send('hermes:quick-entry:dismiss'),
+    // Primary renderer → main → quick window: gateway connection state + the
+    // recent-session options the target picker offers. Main caches the latest
+    // payload so a freshly spawned quick window starts from truth.
+    pushState: payload => ipcRenderer.send('hermes:quick-entry:state', payload),
+    // Quick window subscribes to those pushes.
+    onState: callback => {
+      const listener = (_event, payload) => callback(payload)
+      ipcRenderer.on('hermes:quick-entry:state', listener)
+
+      return () => ipcRenderer.removeListener('hermes:quick-entry:state', listener)
+    },
+    // Main → primary renderer: a submit captured by the quick window.
+    onSubmit: callback => {
+      const listener = (_event, payload) => callback(payload)
+      ipcRenderer.on('hermes:quick-entry:submit', listener)
+
+      return () => ipcRenderer.removeListener('hermes:quick-entry:submit', listener)
+    },
+    // Main → quick window: you were just summoned (reset draft + refocus).
+    onShown: callback => {
+      const listener = () => callback()
+      ipcRenderer.on('hermes:quick-entry:shown', listener)
+
+      return () => ipcRenderer.removeListener('hermes:quick-entry:shown', listener)
+    }
+  },
   getBootProgress: () => ipcRenderer.invoke('hermes:boot-progress:get'),
   getConnectionConfig: profile => ipcRenderer.invoke('hermes:connection-config:get', profile),
   saveConnectionConfig: payload => ipcRenderer.invoke('hermes:connection-config:save', payload),
   applyConnectionConfig: payload => ipcRenderer.invoke('hermes:connection-config:apply', payload),
   testConnectionConfig: payload => ipcRenderer.invoke('hermes:connection-config:test', payload),
+  sshConfigHosts: () => ipcRenderer.invoke('hermes:ssh-config:hosts'),
+  sshResolveHost: host => ipcRenderer.invoke('hermes:ssh-config:resolve', host),
   probeConnectionConfig: remoteUrl => ipcRenderer.invoke('hermes:connection-config:probe', remoteUrl),
   oauthLoginConnectionConfig: remoteUrl => ipcRenderer.invoke('hermes:connection-config:oauth-login', remoteUrl),
   oauthLogoutConnectionConfig: remoteUrl => ipcRenderer.invoke('hermes:connection-config:oauth-logout', remoteUrl),
+  // Hermes Cloud: one portal login powers discovery + silent per-agent sign-in
+  // (cloud-auto-discovery Phase 3).
+  cloud: {
+    status: () => ipcRenderer.invoke('hermes:cloud:status'),
+    login: () => ipcRenderer.invoke('hermes:cloud:login'),
+    logout: () => ipcRenderer.invoke('hermes:cloud:logout'),
+    discover: org => ipcRenderer.invoke('hermes:cloud:discover', org),
+    agentSignIn: dashboardUrl => ipcRenderer.invoke('hermes:cloud:agent-sign-in', dashboardUrl)
+  },
   profile: {
     get: () => ipcRenderer.invoke('hermes:profile:get'),
     set: name => ipcRenderer.invoke('hermes:profile:set', name)
@@ -70,6 +117,7 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   setTitleBarTheme: payload => ipcRenderer.send('hermes:titlebar-theme', payload),
   setNativeTheme: mode => ipcRenderer.send('hermes:native-theme', mode),
   setTranslucency: payload => ipcRenderer.send('hermes:translucency', payload),
+  setKeepAwake: on => ipcRenderer.send('hermes:keep-awake', on),
   setPreviewShortcutActive: active => ipcRenderer.send('hermes:previewShortcutActive', Boolean(active)),
   openExternal: url => ipcRenderer.invoke('hermes:openExternal', url),
   openPreviewInBrowser: url => ipcRenderer.invoke('hermes:openPreviewInBrowser', url),
@@ -98,6 +146,7 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   readDir: dirPath => ipcRenderer.invoke('hermes:fs:readDir', dirPath),
   gitRoot: startPath => ipcRenderer.invoke('hermes:fs:gitRoot', startPath),
   revealPath: targetPath => ipcRenderer.invoke('hermes:fs:reveal', targetPath),
+  openDir: dirPath => ipcRenderer.invoke('hermes:fs:openDir', dirPath),
   renamePath: (targetPath, newName) => ipcRenderer.invoke('hermes:fs:rename', targetPath, newName),
   writeTextFile: (filePath, content) => ipcRenderer.invoke('hermes:fs:writeText', filePath, content),
   trashPath: targetPath => ipcRenderer.invoke('hermes:fs:trash', targetPath),
@@ -108,6 +157,7 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
       ipcRenderer.invoke('hermes:git:worktreeRemove', repoPath, worktreePath, options),
     branchSwitch: (repoPath, branch) => ipcRenderer.invoke('hermes:git:branchSwitch', repoPath, branch),
     branchList: repoPath => ipcRenderer.invoke('hermes:git:branchList', repoPath),
+    baseBranchList: repoPath => ipcRenderer.invoke('hermes:git:baseBranchList', repoPath),
     repoStatus: repoPath => ipcRenderer.invoke('hermes:git:repoStatus', repoPath),
     fileDiff: (repoPath, filePath) => ipcRenderer.invoke('hermes:git:fileDiff', repoPath, filePath),
     scanRepos: (roots, options) => ipcRenderer.invoke('hermes:git:scanRepos', roots, options),
@@ -127,6 +177,7 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
     }
   },
   terminal: {
+    cwd: id => ipcRenderer.invoke('hermes:terminal:cwd', id),
     dispose: id => ipcRenderer.invoke('hermes:terminal:dispose', id),
     resize: (id, size) => ipcRenderer.invoke('hermes:terminal:resize', id, size),
     start: options => ipcRenderer.invoke('hermes:terminal:start', options),
@@ -195,6 +246,14 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
 
     return () => ipcRenderer.removeListener('hermes:backend-exit', listener)
   },
+  // Soft gateway-mode apply finished tearing down the primary backend. Renderer
+  // should wipe session lists + re-dial without a window reload.
+  onConnectionApplied: callback => {
+    const listener = () => callback()
+    ipcRenderer.on('hermes:connection:applied', listener)
+
+    return () => ipcRenderer.removeListener('hermes:connection:applied', listener)
+  },
   onPowerResume: callback => {
     const listener = () => callback()
     ipcRenderer.on('hermes:power-resume', listener)
@@ -213,6 +272,7 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   // current snapshot via getBootstrapState() to recover after a devtools
   // reload mid-bootstrap.
   getBootstrapState: () => ipcRenderer.invoke('hermes:bootstrap:get'),
+  continueBootstrapLocal: () => ipcRenderer.invoke('hermes:bootstrap:continue-local'),
   resetBootstrap: () => ipcRenderer.invoke('hermes:bootstrap:reset'),
   repairBootstrap: () => ipcRenderer.invoke('hermes:bootstrap:repair'),
   cancelBootstrap: () => ipcRenderer.invoke('hermes:bootstrap:cancel'),
@@ -243,5 +303,19 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   themes: {
     fetchMarketplace: id => ipcRenderer.invoke('hermes:vscode-theme:fetch', id),
     searchMarketplace: query => ipcRenderer.invoke('hermes:vscode-theme:search', query)
+  },
+  // Find-in-page (Ctrl/Cmd+F): delegates to Electron's
+  // webContents.findInPage on the IPC sender's window so a Cmd+F pressed
+  // in a secondary session window searches THAT window, not the primary.
+  // `onFoundInPage` returns the unsubscribe fn; the renderer wires it via
+  // `initFindInPageListener` in store/find-in-page.ts and tears it down
+  // when the FindBar unmounts.
+  findInPage: (query, options) => ipcRenderer.invoke('hermes:find-in-page', query, options),
+  stopFindInPage: () => ipcRenderer.invoke('hermes:stop-find-in-page'),
+  onFoundInPage: callback => {
+    const listener = (_event, result) => callback(result)
+    ipcRenderer.on('hermes:found-in-page', listener)
+
+    return () => ipcRenderer.removeListener('hermes:found-in-page', listener)
   }
 })
