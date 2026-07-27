@@ -57,6 +57,17 @@ logger = logging.getLogger(__name__)
 # a card dragged into that column means the first status listed here.
 _COLUMN_STATUS_ORDER = ("todo", "ready", "running", "review", "blocked", "scheduled")
 
+# Mirror mode: every status gets its own same-named column unless the
+# provider declares a fixed built-in with a matching name (Fizzy "Done"
+# -> the closed state). Distinct names make collisions impossible, so
+# this order is just the canonical hermes board order.
+_MIRROR_STATUS_ORDER = ("triage", "todo", "scheduled", "ready", "running",
+                        "blocked", "review", "done", "archived")
+
+# Mapped mode's implicit state map — the pre-mirror hard-coded behavior:
+# these statuses are provider states, not columns.
+_MAPPED_STATE_MAP = {"triage": "inbox", "done": "closed", "archived": "archived"}
+
 _TERMINAL_EVENT_KINDS = ("completed", "blocked", "gave_up")
 
 DEFAULT_COLUMN_MAP = {
@@ -120,11 +131,50 @@ class KanbanSyncEngine:
         self.cfg = sync_cfg or {}
         self.fallback_assignee = fallback_assignee
         self._ticks = 0
+        self._mirror_maps: "Optional[tuple[dict, dict]]" = None
 
     # -- config ------------------------------------------------------------
 
     @property
+    def _mirror(self) -> bool:
+        # Only an explicit "mirror" opts in. DEFAULT_CONFIG carries
+        # mode="mirror", so config-loaded engines default to mirror; a raw
+        # sync_cfg dict without the key (older callers, tests) keeps the
+        # original mapped behavior.
+        return str(self.cfg.get("mode") or "").strip().lower() == "mirror"
+
+    def _maps(self) -> "tuple[dict[str, str], dict[str, str]]":
+        """``(status -> remote column name, status -> fixed-state kind)``.
+
+        Mirror mode derives both from the hermes statuses: a status whose
+        display name matches a provider built-in (case-insensitive) reuses
+        that state; every other status gets a same-named column. Built-ins
+        matching no status ("Maybe?", "Not Now") appear in neither map and
+        stay invisible to sync.
+        """
+        if not self._mirror:
+            return self._column_map, dict(_MAPPED_STATE_MAP)
+        if self._mirror_maps is None:
+            fixed = {
+                str(name).casefold(): kind
+                for name, kind in self.provider.fixed_states().items()
+            }
+            columns: "dict[str, str]" = {}
+            states: "dict[str, str]" = {}
+            for status in _MIRROR_STATUS_ORDER:
+                name = status.capitalize()
+                kind = fixed.get(name.casefold())
+                if kind in ("inbox", "closed", "archived"):
+                    states[status] = kind
+                else:
+                    columns[status] = name
+            self._mirror_maps = (columns, states)
+        return self._mirror_maps
+
+    @property
     def _column_map(self) -> "dict[str, str]":
+        if self._mirror:
+            return dict(self._maps()[0])
         raw = self.cfg.get("column_map")
         return dict(raw) if isinstance(raw, dict) and raw else dict(DEFAULT_COLUMN_MAP)
 
@@ -310,15 +360,18 @@ class KanbanSyncEngine:
         self, card: RemoteCard, topology: "dict[str, str]",
     ) -> Optional[str]:
         """Map a card's location to a hermes status. ``None`` = no opinion
-        (card sits in a column outside the configured map)."""
+        (card sits in a column or provider state outside the mode's map —
+        mirror mode claims neither the inbox nor the archive state)."""
+        column_map, state_map = self._maps()
+        by_kind = {kind: status for status, kind in state_map.items()}
         if card.closed:
-            return "done"
+            return by_kind.get("closed")
         if card.archived:
-            return "archived"
+            return by_kind.get("archived")
         if card.column_ref is None:
-            return "triage"
-        column_map = self._column_map
-        for status in _COLUMN_STATUS_ORDER:
+            return by_kind.get("inbox")
+        order = _MIRROR_STATUS_ORDER if self._mirror else _COLUMN_STATUS_ORDER
+        for status in order:
             name = column_map.get(status)
             if name and topology.get(name) == card.column_ref:
                 return status
@@ -331,11 +384,12 @@ class KanbanSyncEngine:
         topology: "dict[str, str]",
         status: str,
     ) -> "dict[str, object]":
-        if status == "done":
+        kind = self._maps()[1].get(status)
+        if kind == "closed":
             return {"column_ref": None, "closed": True, "archived": False}
-        if status == "archived":
+        if kind == "archived":
             return {"column_ref": None, "closed": False, "archived": True}
-        if status == "triage":
+        if kind == "inbox":
             return {"column_ref": None, "closed": False, "archived": False}
         name = self._column_map.get(status)
         if not name:
@@ -442,6 +496,11 @@ class KanbanSyncEngine:
 
     def _intake_allows(self, card: RemoteCard, topology: "dict[str, str]") -> bool:
         if card.draft or card.closed or card.archived:
+            return False
+        if card.column_ref is None and "inbox" not in self._maps()[1].values():
+            # No status claims the provider inbox (mirror mode): untriaged
+            # cards stay invisible until a human moves them into a
+            # mirrored column.
             return False
         mode = str(self._intake.get("mode") or "all")
         if mode == "columns":

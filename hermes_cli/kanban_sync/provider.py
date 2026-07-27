@@ -49,6 +49,13 @@ class SyncRateLimitError(SyncProviderError):
 
 
 @dataclass(frozen=True)
+class RemoteBoard:
+    ref: str
+    name: str
+    url: str = ""
+
+
+@dataclass(frozen=True)
 class RemoteColumn:
     ref: str
     name: str
@@ -98,6 +105,31 @@ class KanbanSyncProvider(ABC):
     def is_available(self) -> bool:
         """True when config/credentials are present. Must not hit the
         network — this gates watcher startup, not request success."""
+
+    # -- boards --------------------------------------------------------------
+    # Concrete defaults, not abstract: providers written before mirror mode
+    # keep working — no boards to enumerate, no fixed states, and a loud
+    # failure if mirror init asks them to create a board.
+
+    def list_boards(self) -> "list[RemoteBoard]":
+        """Boards visible to the credentials. Providers that cannot
+        enumerate boards return ``[]`` (mirror init then creates instead
+        of reusing)."""
+        return []
+
+    def create_board(self, name: str) -> RemoteBoard:
+        """Create a remote board. Providers without board creation keep
+        this default, which fails loudly — pair an existing board with
+        ``sync init --remote-board`` instead."""
+        raise SyncProviderError(f"provider {self.name!r} cannot create boards")
+
+    def fixed_states(self) -> "dict[str, str]":
+        """Built-in locations the provider cannot remove: display name ->
+        location kind (``"inbox"`` | ``"closed"`` | ``"archived"``).
+        Mirror mode reuses a built-in whose name matches a hermes column
+        (case-insensitive) instead of creating a column; unmatched
+        built-ins stay invisible to sync. Default: none."""
+        return {}
 
     # -- board topology ----------------------------------------------------
 

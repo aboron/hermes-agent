@@ -3,8 +3,13 @@
 Three small subcommands for bootstrap and debugging; steady-state syncing
 runs in the gateway watcher (``gateway/kanban_sync_watcher.py``):
 
-- ``init --remote-board <id>``: verify auth, create the mapped columns on
-  the remote board, record the pairing row.
+- ``init``: verify auth, provision the remote board, record the pairing
+  row. In mirror mode (the config default) ``--remote-board`` is optional:
+  omitted, init creates (or reuses by name) a dedicated
+  ``<board_prefix><Board Name>`` remote board and writes the pairing plus
+  ``enabled: true`` back to config.yaml. With ``--remote-board <id>`` (and
+  always in mapped mode) it pairs the existing board and prints the config
+  snippet instead.
 - ``once [--full] [--remote-board <id>]``: one blocking sync pass.
 - ``status``: pairings, cursors, link counts, last errors.
 
@@ -23,7 +28,11 @@ from hermes_cli import kanban_db as kb
 from hermes_cli.kanban_sync import get_provider, list_provider_names
 from hermes_cli.kanban_sync import state
 from hermes_cli.kanban_sync.engine import KanbanSyncEngine
-from hermes_cli.kanban_sync.provider import KanbanSyncProvider, SyncProviderError
+from hermes_cli.kanban_sync.provider import (
+    KanbanSyncProvider,
+    RemoteBoard,
+    SyncProviderError,
+)
 
 
 def _load_cfgs() -> "tuple[dict, dict, dict]":
@@ -101,18 +110,90 @@ def cmd_sync(args: argparse.Namespace) -> int:
     return 2
 
 
+def _mirror_board_name(sync_cfg: dict) -> str:
+    # An explicit board_prefix of "" means "no prefix" — only a missing
+    # key falls back to the default (so no `or`-chaining here).
+    prefix = sync_cfg.get("board_prefix")
+    prefix = "Hermes_" if prefix is None else str(prefix)
+    current = kb.get_current_board()
+    display = str(kb.read_board_metadata(current).get("name") or "").strip()
+    return f"{prefix}{display or current}"
+
+
+def _ensure_mirror_board(
+    provider: KanbanSyncProvider, sync_cfg: dict,
+) -> "Optional[RemoteBoard]":
+    """Create — or reuse by exact name — the dedicated mirror board.
+
+    Returns ``None`` (after printing why) when the name-matched remote
+    board is already paired to a different local board: two local boards
+    with colliding display names must not share one mirror.
+    """
+    name = _mirror_board_name(sync_cfg)
+    current = kb.get_current_board()
+    match = next((b for b in provider.list_boards() if b.name == name), None)
+    if match is not None:
+        for pairing in sync_cfg.get("pairings") or []:
+            if not isinstance(pairing, dict):
+                continue
+            board = str(pairing.get("board") or "").strip() or kb.DEFAULT_BOARD
+            if str(pairing.get("remote_board") or "") == match.ref and board != current:
+                print(
+                    f"kanban sync init: remote board {name!r} ({match.ref}) "
+                    f"is already paired to local board {board!r}; set "
+                    f"kanban.sync.board_prefix to give this board a "
+                    f"distinct name.",
+                    file=sys.stderr,
+                )
+                return None
+        print(f"Reusing remote board {name!r} ({provider.name}:{match.ref})")
+        return match
+    board = provider.create_board(name)
+    print(f"Created remote board {name!r} ({provider.name}:{board.ref})")
+    return board
+
+
+def _record_pairing_in_config(cfg: dict, current: str, remote_board: str) -> None:
+    kanban_cfg = cfg.setdefault("kanban", {})
+    sync_cfg = kanban_cfg.setdefault("sync", {})
+    sync_cfg["enabled"] = True
+    if not isinstance(sync_cfg.get("pairings"), list):
+        sync_cfg["pairings"] = []
+    entry = {
+        "board": "" if current == kb.DEFAULT_BOARD else current,
+        "remote_board": remote_board,
+    }
+    if entry not in sync_cfg["pairings"]:
+        sync_cfg["pairings"].append(entry)
+
+
 def _cmd_init(args: argparse.Namespace) -> int:
     remote_board = str(getattr(args, "remote_board", None) or "").strip()
-    if not remote_board:
+    cfg, kanban_cfg, sync_cfg = _load_cfgs()
+    # Absent key = legacy mapped behavior; real config always carries the
+    # key (DEFAULT_CONFIG says "mirror"), matching the engine's fallback.
+    mirror_bootstrap = (
+        not remote_board
+        and str(sync_cfg.get("mode") or "").strip().lower() == "mirror"
+    )
+    if not remote_board and not mirror_bootstrap:
         print(
             "kanban sync init: --remote-board <id> is required",
             file=sys.stderr,
         )
         return 2
-    _, kanban_cfg, sync_cfg = _load_cfgs()
     provider = _resolve_provider(sync_cfg)
     if provider is None:
         return 1
+    if mirror_bootstrap:
+        try:
+            board = _ensure_mirror_board(provider, sync_cfg)
+        except SyncProviderError as exc:
+            print(f"kanban sync init: {exc}", file=sys.stderr)
+            return 1
+        if board is None:
+            return 1
+        remote_board = board.ref
     engine = _make_engine(provider, kanban_cfg, sync_cfg, remote_board)
     try:
         with kb.connect_closing() as conn:
@@ -128,17 +209,31 @@ def _cmd_init(args: argparse.Namespace) -> int:
     configured = {
         p["remote_board"] for p in _current_board_pairings(sync_cfg)
     }
-    if remote_board not in configured:
-        board_field = "" if current == kb.DEFAULT_BOARD else current
-        print(
-            "\nAdd this pairing to config.yaml so the gateway syncs it:\n"
-            "  kanban:\n"
-            "    sync:\n"
-            "      enabled: true\n"
-            "      pairings:\n"
-            f"        - board: \"{board_field}\"\n"
-            f"          remote_board: \"{remote_board}\""
-        )
+    if remote_board in configured:
+        return 0
+    if mirror_bootstrap:
+        from hermes_cli.config import is_managed, save_config
+
+        if not is_managed():
+            _record_pairing_in_config(cfg, current, remote_board)
+            save_config(cfg)
+            print(
+                "\nconfig.yaml updated: pairing recorded and "
+                "kanban.sync.enabled set."
+            )
+            return 0
+        # Managed installs can't be written to — fall through to the
+        # snippet so the admin can apply it through their config layer.
+    board_field = "" if current == kb.DEFAULT_BOARD else current
+    print(
+        "\nAdd this pairing to config.yaml so the gateway syncs it:\n"
+        "  kanban:\n"
+        "    sync:\n"
+        "      enabled: true\n"
+        "      pairings:\n"
+        f"        - board: \"{board_field}\"\n"
+        f"          remote_board: \"{remote_board}\""
+    )
     return 0
 
 

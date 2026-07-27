@@ -815,3 +815,171 @@ def test_footer_lookalike_user_line_survives_roundtrip(provider):
         assert "[fake] see card 42 for rollback" in body
         assert body.rstrip().endswith(f"[fake] fake://cards/{ref}")
     assert_quiescent(engine, provider)
+
+
+# ---------------------------------------------------------------------------
+# Mirror mode
+# ---------------------------------------------------------------------------
+# BASE_CFG keeps its column_map in every mirror test on purpose: mirror
+# mode must ignore it entirely (no "In Progress" column may ever appear).
+
+MIRROR_COLUMNS = {"Triage", "Todo", "Scheduled", "Ready", "Running",
+                  "Blocked", "Review", "Archived"}
+
+
+def make_mirror_engine(provider, **overrides):
+    return make_engine(provider, mode="mirror", **overrides)
+
+
+def test_mirror_first_sync_creates_hermes_columns_never_builtins(provider):
+    engine = make_mirror_engine(provider)
+    engine.sync_once()
+    assert set(provider.columns) == MIRROR_COLUMNS
+    # "Done" is Fizzy's built-in closed state (name-matched, reused);
+    # "Maybe?"/"Not Now" match no hermes column and stay untouched.
+    assert "Done" not in provider.columns
+    assert "In Progress" not in provider.columns  # column_map ignored
+    assert_quiescent(engine, provider)
+
+
+def test_mirror_inbox_card_invisible_until_moved_to_column(provider):
+    engine = make_mirror_engine(provider)
+    engine.sync_once()
+    ref = provider.human_add_card(title="maybe someday", creator="doc")
+    engine.sync_once()
+    with kb.connect() as conn:
+        assert kb.list_tasks(conn, include_archived=True) == []
+    provider.human_move(ref, column_name="Triage")
+    engine.sync_once()
+    with kb.connect() as conn:
+        task = _single_task(conn)
+        assert task.title == "maybe someday"
+        assert task.status == "triage"
+    assert_quiescent(engine, provider)
+
+
+def test_mirror_scheduled_and_running_columns_import_distinctly(provider):
+    engine = make_mirror_engine(provider)
+    engine.sync_once()
+    provider.human_add_card(title="wip", column_name="Running")
+    provider.human_add_card(title="later", column_name="Scheduled")
+    engine.sync_once()
+    with kb.connect() as conn:
+        by_title = {
+            t.title: t.status
+            for t in kb.list_tasks(conn, include_archived=True)
+        }
+    assert by_title == {"wip": "running", "later": "scheduled"}
+    assert_quiescent(engine, provider)
+
+
+def test_mirror_local_statuses_park_cards_in_matching_columns(provider):
+    engine = make_mirror_engine(provider)
+    ref, tid = _import_one(engine, provider, title="walker",
+                           column_name="Triage")
+    for status, column in [
+        ("todo", "Todo"), ("scheduled", "Scheduled"), ("ready", "Ready"),
+        ("running", "Running"), ("review", "Review"), ("blocked", "Blocked"),
+    ]:
+        with kb.connect() as conn:
+            kb.set_status_direct(conn, tid, status, source="test")
+        engine.sync_once()
+        assert provider.column_name_of(ref) == column, status
+    # archived parks in the real "Archived" column, NOT the provider's
+    # archive state ("Not Now" is ignored).
+    with kb.connect() as conn:
+        kb.set_status_direct(conn, tid, "archived", source="test")
+    engine.sync_once()
+    assert provider.column_name_of(ref) == "Archived"
+    assert provider.cards[ref]["archived"] is False
+    assert_quiescent(engine, provider)
+
+
+def test_mirror_local_done_closes_card_via_builtin(provider):
+    engine = make_mirror_engine(provider)
+    ref, tid = _import_one(engine, provider, title="finish me",
+                           column_name="Ready")
+    with kb.connect() as conn:
+        kb.set_status_direct(conn, tid, "done", source="test")
+    engine.sync_once()
+    assert provider.cards[ref]["closed"] is True
+    assert_quiescent(engine, provider)
+
+
+def test_mirror_remote_close_maps_to_done(provider):
+    engine = make_mirror_engine(provider)
+    ref, tid = _import_one(engine, provider, title="ship it",
+                           column_name="Ready")
+    provider.human_move(ref, closed=True)
+    engine.sync_once()
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "done"
+    assert_quiescent(engine, provider)
+
+
+def test_mirror_remote_not_now_is_no_opinion(provider):
+    engine = make_mirror_engine(provider)
+    ref, tid = _import_one(engine, provider, title="parked remotely",
+                           column_name="Ready")
+    provider.human_move(ref, archived=True)
+    engine.sync_once()
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "ready"
+    assert_quiescent(engine, provider)
+
+
+def test_mirror_remote_unknown_column_is_no_opinion(provider):
+    engine = make_mirror_engine(provider)
+    ref, tid = _import_one(engine, provider, title="wandering",
+                           column_name="Ready")
+    provider.columns["Elsewhere"] = "c99"
+    provider.human_move(ref, column_name="Elsewhere")
+    engine.sync_once()
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "ready"
+    assert_quiescent(engine, provider)
+
+
+def test_mirror_exports_triage_task_to_triage_column(provider):
+    engine = make_mirror_engine(provider)
+    engine.sync_once()
+    with kb.connect() as conn:
+        kb.create_task(conn, title="untriaged local", triage=True)
+    engine.sync_once()
+    ref = next(iter(provider.cards))
+    # Mapped mode would leave this in the inbox; mirror uses the column.
+    assert provider.column_name_of(ref) == "Triage"
+    assert_quiescent(engine, provider)
+
+
+def test_mirror_without_fixed_states_gets_all_nine_columns(provider):
+
+    class _BareProvider(FakeKanbanProvider):
+        def fixed_states(self):
+            return {}
+
+    bare = _BareProvider()
+    engine = make_mirror_engine(bare)
+    engine.sync_once()
+    assert set(bare.columns) == MIRROR_COLUMNS | {"Done"}
+    # With no closed built-in to reuse, done is an ordinary column move.
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="generic provider")
+    engine.sync_once()
+    ref = next(iter(bare.cards))
+    with kb.connect() as conn:
+        kb.set_status_direct(conn, tid, "done", source="test")
+    engine.sync_once()
+    assert bare.column_name_of(ref) == "Done"
+    assert bare.cards[ref]["closed"] is False
+
+
+def test_explicit_mapped_mode_keeps_legacy_semantics(provider):
+    engine = make_engine(provider, mode="mapped")
+    engine.sync_once()
+    provider.human_add_card(title="From a human", creator="doc")
+    engine.sync_once()
+    with kb.connect() as conn:
+        assert _single_task(conn).status == "triage"
+    assert "Triage" not in provider.columns
+    assert_quiescent(engine, provider)

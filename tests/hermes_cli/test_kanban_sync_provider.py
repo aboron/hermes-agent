@@ -54,6 +54,13 @@ def test_remote_card_untriaged_has_no_column():
     assert _card(column_ref="c9").column_ref == "c9"
 
 
+def test_remote_board_is_frozen():
+    board = prov.RemoteBoard(ref="b1", name="Hermes_Default")
+    assert board.url == ""
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        board.name = "nope"
+
+
 # ---------------------------------------------------------------------------
 # Errors
 # ---------------------------------------------------------------------------
@@ -78,6 +85,17 @@ def test_rate_limit_error_carries_retry_after():
 def test_provider_abc_is_not_instantiable():
     with pytest.raises(TypeError):
         prov.KanbanSyncProvider()  # abstract
+
+
+def test_board_methods_have_safe_defaults():
+    # Providers written before mirror mode (like this minimal fake, which
+    # overrides none of the board methods) must keep working: no boards to
+    # enumerate, no fixed states, and a loud failure on create_board.
+    p = _FakeProvider({})
+    assert p.list_boards() == []
+    assert p.fixed_states() == {}
+    with pytest.raises(prov.SyncProviderError):
+        p.create_board("Hermes_Default")
 
 
 # ---------------------------------------------------------------------------

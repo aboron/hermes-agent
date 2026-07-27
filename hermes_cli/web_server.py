@@ -886,6 +886,13 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
         "description": "Dangerous command approval mode",
         "options": ["manual", "smart", "off"],
     },
+    "kanban.sync.mode": {
+        "type": "select",
+        "description": "External kanban layout: mirror (dedicated remote "
+                       "board per hermes board) or mapped (existing board "
+                       "via column_map)",
+        "options": ["mirror", "mapped"],
+    },
     "context.engine": {
         "type": "select",
         "description": "Context management engine",

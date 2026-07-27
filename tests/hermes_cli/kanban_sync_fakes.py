@@ -14,6 +14,7 @@ from typing import Optional
 
 from hermes_cli.kanban_sync.provider import (
     KanbanSyncProvider,
+    RemoteBoard,
     RemoteCard,
     RemoteColumn,
     RemoteComment,
@@ -24,6 +25,7 @@ from hermes_cli.kanban_sync.provider import (
 class FakeKanbanProvider(KanbanSyncProvider):
     def __init__(self, sync_cfg: Optional[dict] = None):
         self.cfg = sync_cfg or {}
+        self.boards: "dict[str, str]" = {}           # ref -> name
         self.columns: "dict[str, str]" = {}          # name -> ref
         self.cards: "dict[str, dict]" = {}           # ref -> mutable state
         self.comments: "dict[str, list[RemoteComment]]" = {}
@@ -32,6 +34,7 @@ class FakeKanbanProvider(KanbanSyncProvider):
         self._card_n = 0
         self._comment_n = 0
         self._col_n = 0
+        self._board_n = 0
         # Failure injection: op name -> queue of exceptions; each matching
         # call pops and raises one until the queue is empty.
         self.fail_ops: "dict[str, list[Exception]]" = {}
@@ -165,6 +168,23 @@ class FakeKanbanProvider(KanbanSyncProvider):
 
     def is_available(self) -> bool:
         return True
+
+    def fixed_states(self):
+        # Fizzy-shaped built-ins; only consulted in mirror mode.
+        return {"Maybe?": "inbox", "Done": "closed", "Not Now": "archived"}
+
+    def list_boards(self):
+        return [
+            RemoteBoard(ref=r, name=n, url=f"fake://boards/{r}")
+            for r, n in self.boards.items()
+        ]
+
+    def create_board(self, name):
+        self.writes.append(("create_board", name))
+        self._board_n += 1
+        ref = f"b{self._board_n}"
+        self.boards[ref] = name
+        return RemoteBoard(ref=ref, name=name, url=f"fake://boards/{ref}")
 
     def list_columns(self, board_ref):
         return [RemoteColumn(ref=r, name=n) for n, r in self.columns.items()]

@@ -947,11 +947,13 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     sync_sub = p_sync.add_subparsers(dest="sync_action")
     p_sync_init = sync_sub.add_parser(
         "init",
-        help="Verify auth, create the mapped columns remotely, record the pairing",
+        help="Verify auth, provision the remote board/columns, record the pairing",
     )
     p_sync_init.add_argument(
         "--remote-board", dest="remote_board",
-        help="Remote board id to pair with the current board",
+        help="Remote board id to pair with the current board (omit in "
+             "mirror mode to create/reuse a dedicated "
+             "'<board_prefix><Board Name>' board)",
     )
     p_sync_once = sync_sub.add_parser(
         "once", help="Run one sync pass for this board's pairings",

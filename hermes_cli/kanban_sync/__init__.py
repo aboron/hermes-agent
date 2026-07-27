@@ -7,6 +7,7 @@ step with it bidirectionally. See ``docs/kanban/external-sync.md``.
 
 from hermes_cli.kanban_sync.provider import (
     KanbanSyncProvider,
+    RemoteBoard,
     RemoteCard,
     RemoteColumn,
     RemoteComment,
@@ -23,6 +24,7 @@ from hermes_cli.kanban_sync.registry import (
 
 __all__ = [
     "KanbanSyncProvider",
+    "RemoteBoard",
     "RemoteCard",
     "RemoteColumn",
     "RemoteComment",

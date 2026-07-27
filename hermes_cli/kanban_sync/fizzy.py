@@ -33,6 +33,7 @@ import httpx
 
 from hermes_cli.kanban_sync.provider import (
     KanbanSyncProvider,
+    RemoteBoard,
     RemoteCard,
     RemoteColumn,
     RemoteComment,
@@ -367,6 +368,34 @@ class FizzyProvider(KanbanSyncProvider):
             author=str(creator.get("name") or ""),
             body_text=str(text),
             created_at=data.get("created_at"),
+        )
+
+    # -- boards ------------------------------------------------------------
+
+    def fixed_states(self) -> "dict[str, str]":
+        return {"Maybe?": "inbox", "Done": "closed", "Not Now": "archived"}
+
+    def list_boards(self) -> "list[RemoteBoard]":
+        return [
+            RemoteBoard(
+                ref=str(b["id"]),
+                name=str(b.get("name") or ""),
+                url=str(b.get("url") or ""),
+            )
+            for b in self._client.paginate("/boards")
+        ]
+
+    def create_board(self, name: str) -> RemoteBoard:
+        # boards.md documents the payload nested under a ``board`` key
+        # (unlike column/card creates, which Rails also accepts flat).
+        resp = self._client.request(
+            "POST", "/boards", json={"board": {"name": name}},
+        )
+        data = self._client._follow_create(resp)
+        return RemoteBoard(
+            ref=str(data["id"]),
+            name=str(data.get("name") or name),
+            url=str(data.get("url") or ""),
         )
 
     # -- topology ----------------------------------------------------------

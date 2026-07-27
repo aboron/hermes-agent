@@ -20,22 +20,22 @@ be added by registering another provider.
 
 ## Setup (Fizzy)
 
+By default the sync runs in **mirror mode**: `sync init` creates a
+dedicated Fizzy board per Hermes board — named
+`<board_prefix><Board Name>`, e.g. **Hermes_Default** — with columns
+copying the Hermes board exactly. No column mapping, no hand-copied
+board ids.
+
 1. In Fizzy, create a personal access token with **Read + Write**
    permission (profile → API → Personal access tokens) and note your
    account id — it's the number in your Fizzy URLs
    (`https://fizzy.example.com/897362094/...`).
 
-2. Configure `~/.hermes/config.yaml`:
+2. Configure the provider credentials in `~/.hermes/config.yaml`:
 
    ```yaml
    kanban:
      sync:
-       enabled: true
-       provider: fizzy
-       interval_seconds: 30
-       pairings:
-         - board: ""             # local board slug ("" = default board)
-           remote_board: "abc123" # Fizzy board id (from the board URL)
        fizzy:
          base_url: "https://fizzy.example.com"
          account_slug: "897362094"
@@ -45,12 +45,23 @@ be added by registering another provider.
    Export the token in the gateway's environment:
    `export HERMES_FIZZY_TOKEN=...`
 
-3. Bootstrap the pairing (verifies auth, creates the workflow columns on
-   the Fizzy board, records the pairing):
+3. Bootstrap:
 
    ```
-   hermes kanban sync init --remote-board abc123
+   hermes kanban sync init
    ```
+
+   This verifies auth, creates (or reuses, if a board with that exact
+   name already exists) the **Hermes_Default** board, creates its
+   columns, then writes the pairing and `enabled: true` back to
+   config.yaml for you. Use `--board <slug>` to mirror a non-default
+   board; set `kanban.sync.board_prefix` to change the `Hermes_` prefix
+   (`""` = no prefix).
+
+   To pair a **pre-existing** remote board instead, pass
+   `--remote-board <id>` — then nothing is auto-written and the command
+   prints the config snippet to add yourself (see mapped mode below for
+   the classic layout).
 
 4. Either restart the gateway (the sync watcher starts automatically
    when `kanban.sync.enabled` is true) or drive it manually:
@@ -67,8 +78,45 @@ editing config (same escape-hatch pattern as
 
 ## Status ↔ location mapping
 
-The sync engine auto-creates missing columns (names configurable via
-`kanban.sync.column_map`):
+### Mirror mode (default, `kanban.sync.mode: mirror`)
+
+Every Hermes column appears on the remote board under its own name. A
+provider built-in whose name matches a Hermes column is reused instead
+of duplicated — on Fizzy that's the closed state ("Done") — and
+built-ins matching no Hermes column ("Maybe?", "Not Now") are ignored
+entirely:
+
+| Hermes status | Fizzy location |
+|---|---|
+| `triage` | column **Triage** |
+| `todo` | column **Todo** |
+| `scheduled` | column **Scheduled** |
+| `ready` | column **Ready** |
+| `running` | column **Running** |
+| `blocked` | column **Blocked** |
+| `review` | column **Review** |
+| `done` | closed ("Done" — Fizzy's built-in, reused by name match) |
+| `archived` | column **Archived** |
+
+Consequences of ignoring the built-ins:
+
+- Cards sitting in the **"Maybe?" inbox are invisible to sync** — they
+  are not imported until a human drags them into a mirrored column
+  (start with **Triage**). Closing a card still maps to `done` in both
+  directions.
+- Cards in **"Not Now" are left alone** (no local status opinion), and
+  Hermes never parks cards there — `archived` tasks go to the real
+  **Archived** column. A card someone moved to "Not Now" snaps back to
+  a mirrored column on the task's next local status change.
+
+`column_map` is ignored in mirror mode.
+
+### Mapped mode (`kanban.sync.mode: mapped`)
+
+The pre-mirror layout: pair an existing remote board
+(`sync init --remote-board <id>` is required) and lay Hermes statuses
+onto its columns via `kanban.sync.column_map`. The engine auto-creates
+missing columns:
 
 | Hermes status | Fizzy location |
 |---|---|
@@ -81,6 +129,8 @@ The sync engine auto-creates missing columns (names configurable via
 | `done` | closed ("Done") |
 | `archived` | "Not Now" |
 
+### Both modes
+
 Remote → local moves use the structured verbs where possible: closing a
 card completes the task (`complete_task`, so run history stays correct),
 dragging to **Blocked** blocks it with `kind=needs_input`, dragging a
@@ -89,8 +139,8 @@ promoting a dependency-gated child to Ready before its parents finish —
 are pushed back: the card snaps to the column matching local truth on
 the same sync pass.
 
-Dragging a card into a column that is not in `column_map` leaves the
-local status untouched (the bridge has no opinion about custom columns).
+Dragging a card into a column outside the mode's map leaves the local
+status untouched (the bridge has no opinion about custom columns).
 
 ## Intake and export
 
@@ -142,6 +192,17 @@ comment on the card and unlinks it.
 
 ## Operational notes
 
+- **Mirror board naming**: the board name is only computed at `sync
+  init`. Renaming the Hermes board (or the remote board) later doesn't
+  re-pair anything — but re-running `sync init` after a rename will
+  create a *second* remote board under the new name. Reuse-by-name also
+  means two local boards with identical display names need distinct
+  `board_prefix` values before each can get its own mirror.
+- **Fizzy auto-postpone**: Fizzy boards move cards inactive for
+  `auto_postpone_period_in_days` (default 30) into "Not Now". In mirror
+  mode the sync ignores "Not Now", so long-idle cards drift off the
+  mirrored columns without changing the Hermes status; the card comes
+  back on the task's next local status change.
 - **Polling**: the watcher polls with `interval_seconds` (default 30s),
   using the provider's activity cursor (`last_active_at` in Fizzy) and
   fingerprint no-ops, so idle boards cost one listing request per tick.

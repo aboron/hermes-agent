@@ -3032,15 +3032,32 @@ DEFAULT_CONFIG = {
             "enabled": False,
             # Provider registry name. "fizzy" ships in-tree.
             "provider": "fizzy",
+            # How the remote board is laid out:
+            #   mirror (default) — `sync init` creates (or reuses by name) a
+            #     dedicated "<board_prefix><Board Name>" remote board whose
+            #     columns copy the hermes columns exactly. Provider built-ins
+            #     whose name matches a hermes column are reused (Fizzy's
+            #     "Done" closed state); the rest ("Maybe?", "Not Now") are
+            #     invisible to sync.
+            #   mapped — pair a pre-existing remote board and lay hermes
+            #     statuses onto its columns via column_map; triage maps to
+            #     the provider inbox, done/archived to its closed/not-now
+            #     states.
+            "mode": "mirror",
+            # Name prefix for boards created by mirror-mode `sync init`.
+            # "" means no prefix.
+            "board_prefix": "Hermes_",
             # Seconds between sync polls.
             "interval_seconds": 30,
             # Board pairings: [{"board": "", "remote_board": "<board id>"}].
             # "board" is the local board slug ("" = default board);
-            # "remote_board" is the provider's board id.
+            # "remote_board" is the provider's board id. Mirror-mode
+            # `sync init` records these automatically.
             "pairings": [],
-            # hermes status -> remote column name. done/archived map to the
-            # provider's closed / not-now states, never to columns; triage
-            # maps to the provider's untriaged inbox.
+            # Mapped mode only (mirror derives its own map): hermes status
+            # -> remote column name. done/archived map to the provider's
+            # closed / not-now states, never to columns; triage maps to
+            # the provider's untriaged inbox.
             "column_map": {
                 "todo": "Todo",
                 "ready": "Ready",

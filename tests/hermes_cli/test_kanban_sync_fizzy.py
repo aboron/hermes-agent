@@ -227,6 +227,62 @@ def test_get_card_maps_untriaged_inbox():
 
 
 # ---------------------------------------------------------------------------
+# Boards (mirror mode)
+# ---------------------------------------------------------------------------
+
+def test_fixed_states_names_fizzy_builtins():
+    assert fizzy.FizzyProvider(_cfg()).fixed_states() == {
+        "Maybe?": "inbox", "Done": "closed", "Not Now": "archived",
+    }
+
+
+def test_list_boards_paginates_and_maps():
+    def handler(request):
+        url = str(request.url)
+        if "page=2" in url:
+            return httpx.Response(200, json=[
+                {"id": "b2", "name": "Beta", "url": f"{BASE}/{ACCT}/boards/b2"},
+            ])
+        return httpx.Response(
+            200,
+            json=[{"id": "b1", "name": "Hermes_Default",
+                   "url": f"{BASE}/{ACCT}/boards/b1"}],
+            headers={"Link": f'<{BASE}/{ACCT}/boards?page=2>; rel="next"'},
+        )
+
+    boards = _provider(handler).list_boards()
+    assert [(b.ref, b.name) for b in boards] == [
+        ("b1", "Hermes_Default"), ("b2", "Beta"),
+    ]
+    assert boards[0].url == f"{BASE}/{ACCT}/boards/b1"
+
+
+def test_create_board_posts_nested_payload_and_follows_location():
+    """boards.md documents the create payload nested under a ``board`` key
+    and a 201 whose Location already contains the account slug."""
+    def handler(request):
+        path = request.url.path
+        if request.method == "POST" and path == f"/{ACCT}/boards":
+            assert json.loads(request.content) == {
+                "board": {"name": "Hermes_Default"},
+            }
+            return httpx.Response(
+                201, headers={"Location": f"/{ACCT}/boards/b9.json"},
+            )
+        if request.method == "GET" and path == f"/{ACCT}/boards/b9.json":
+            return httpx.Response(200, json={
+                "id": "b9", "name": "Hermes_Default",
+                "url": f"{BASE}/{ACCT}/boards/b9",
+            })
+        raise AssertionError(f"{request.method} {path}")
+
+    board = _provider(handler).create_board("Hermes_Default")
+    assert board.ref == "b9"
+    assert board.name == "Hermes_Default"
+    assert board.url == f"{BASE}/{ACCT}/boards/b9"
+
+
+# ---------------------------------------------------------------------------
 # move_card sequencing
 # ---------------------------------------------------------------------------
 
