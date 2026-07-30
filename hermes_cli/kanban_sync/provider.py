@@ -1,7 +1,7 @@
 """Kanban-sync provider interface.
 
 The sync engine (:mod:`hermes_cli.kanban_sync.engine`) mirrors a local
-kanban board to an external service (Fizzy, ...) through this minimal
+kanban board to an external service (Fizzy, Kanboard, ...) through this minimal
 surface. Providers normalize the remote service's data model into the
 ``Remote*`` DTOs below; everything provider-specific (auth, pagination,
 HTML bodies, state-transition sequencing) stays inside the provider.

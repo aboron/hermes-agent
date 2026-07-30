@@ -86,6 +86,11 @@ def _ensure_builtins() -> None:
         register_provider("fizzy", FizzyProvider)
     except ImportError:
         logger.debug("builtin fizzy provider unavailable", exc_info=True)
+    try:
+        from hermes_cli.kanban_sync.kanboard import KanboardProvider
+        register_provider("kanboard", KanboardProvider)
+    except ImportError:
+        logger.debug("builtin kanboard provider unavailable", exc_info=True)
 
 
 def _reset_for_tests() -> None:

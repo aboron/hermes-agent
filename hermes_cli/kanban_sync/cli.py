@@ -58,8 +58,8 @@ def _resolve_provider(sync_cfg: dict) -> Optional[KanbanSyncProvider]:
     if not provider.is_available():
         print(
             f"kanban sync: provider {name!r} is not configured — set "
-            f"kanban.sync.{name}.base_url / account_slug and a token "
-            f"(token or token_env) in config.yaml.",
+            f"kanban.sync.{name}.base_url and a token (token or "
+            f"token_env) in config.yaml; see docs/kanban/external-sync.md.",
             file=sys.stderr,
         )
         return None

@@ -2201,7 +2201,7 @@ DEFAULT_CONFIG = {
         # before the reclaim.  0 disables stale detection entirely.
         "dispatch_stale_timeout_seconds": 14400,
         # External kanban sync. When enabled, the gateway keeps each paired
-        # remote board (Fizzy, ...) and its local board in step
+        # remote board (Fizzy, Kanboard, ...) and its local board in step
         # bidirectionally: cards filed in the remote UI become local tasks,
         # local status changes move cards between remote columns, comments
         # flow both ways with provenance prefixes. The local SQLite board
@@ -2209,7 +2209,7 @@ DEFAULT_CONFIG = {
         # See docs/kanban/external-sync.md.
         "sync": {
             "enabled": False,
-            # Provider registry name. "fizzy" ships in-tree.
+            # Provider registry name. "fizzy" and "kanboard" ship in-tree.
             "provider": "fizzy",
             # How the remote board is laid out:
             #   mirror (default) — `sync init` creates (or reuses by name) a
@@ -2266,6 +2266,19 @@ DEFAULT_CONFIG = {
                 "account_slug": "",
                 "token": "",
                 "token_env": "HERMES_FIZZY_TOKEN",
+                "timeout_seconds": 15,
+            },
+            # Kanboard provider settings (kanboard.org). token wins over
+            # token_env. base_url is the Kanboard root URL (the client
+            # appends /jsonrpc.php). username "jsonrpc" pairs with the
+            # application API token; a real username pairs with that
+            # user's personal API token instead (sync comments are then
+            # attributed to them).
+            "kanboard": {
+                "base_url": "",
+                "username": "jsonrpc",
+                "token": "",
+                "token_env": "HERMES_KANBOARD_TOKEN",
                 "timeout_seconds": 15,
             },
         },

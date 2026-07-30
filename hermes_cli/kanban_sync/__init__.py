@@ -1,7 +1,7 @@
 """External kanban sync — mirror a local board to a remote service.
 
 The local SQLite board stays the operational source of truth (dispatcher,
-claims, runs, events); this package keeps a remote board (Fizzy, ...) in
+claims, runs, events); this package keeps a remote board (Fizzy, Kanboard, ...) in
 step with it bidirectionally. See ``docs/kanban/external-sync.md``.
 """
 

@@ -934,7 +934,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     # --- sync ---
     p_sync = sub.add_parser(
         "sync",
-        help="External board sync (Fizzy, ...): init / once / status",
+        help="External board sync (Fizzy, Kanboard, ...): init / once / status",
         description=(
             "Mirror this board to an external kanban service. Configure "
             "kanban.sync in config.yaml; the gateway then syncs "

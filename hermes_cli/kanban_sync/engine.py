@@ -339,6 +339,12 @@ class KanbanSyncEngine:
     def _footer(self, url: str) -> str:
         return f"[{self.provider.name}] {url}"
 
+    @property
+    def _sync_actor(self) -> str:
+        # created_by stamp on imported tasks; the export query excludes
+        # exactly this value so a provider never re-exports its own imports.
+        return f"{self.provider.name}-sync"
+
     def _compose_body(self, body_text: str, url: str) -> str:
         parts = [p for p in (body_text.strip("\n"), self._footer(url) if url else "") if p]
         return "\n\n".join(parts)
@@ -545,7 +551,7 @@ class KanbanSyncEngine:
             assignee=assignee,
             priority=golden_priority if card.golden else 0,
             triage=True,
-            created_by="fizzy-sync",
+            created_by=self._sync_actor,
             idempotency_key=(
                 f"kanban-sync:{self.provider.name}:"
                 f"{self.remote_board_ref}:{card.ref}"
@@ -673,9 +679,9 @@ class KanbanSyncEngine:
             "  ON l.task_id = t.id AND l.pairing_id = ? "
             "WHERE l.task_id IS NULL "
             "  AND t.status NOT IN ('done', 'archived') "
-            "  AND COALESCE(t.created_by, '') != 'fizzy-sync'"
+            "  AND COALESCE(t.created_by, '') != ?"
         )
-        params: "list[object]" = [pairing["id"]]
+        params: "list[object]" = [pairing["id"], self._sync_actor]
         if not backfill:
             sql += " AND t.created_at >= ?"
             params.append(int(pairing.get("created_at") or 0))
@@ -917,7 +923,7 @@ class KanbanSyncEngine:
                     author = self._one_line(comment.author, limit=120) or "unknown"
                     local_id = kb.add_comment(
                         conn, task_id,
-                        author=f"fizzy:{author}",
+                        author=f"{self.provider.name}:{author}",
                         body=body,
                     )
                     state.record_pushed_comment(

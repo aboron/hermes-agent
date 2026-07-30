@@ -1,6 +1,6 @@
 """External kanban sync watcher for GatewayRunner.
 
-Polls the configured external board provider (Fizzy, ...) and keeps each
+Polls the configured external board provider (Fizzy, Kanboard, ...) and keeps each
 paired local board in step with its remote counterpart via
 :class:`hermes_cli.kanban_sync.engine.KanbanSyncEngine`. Follows the same
 shape as the other kanban watchers in ``gateway/kanban_watchers.py``:

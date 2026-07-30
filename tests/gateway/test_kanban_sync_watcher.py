@@ -196,3 +196,5 @@ def test_kanban_sync_config_defaults(monkeypatch, tmp_path):
     assert sync["intake"]["mode"] == "all"
     assert sync["export"]["enabled"] is True
     assert sync["fizzy"]["token_env"] == "HERMES_FIZZY_TOKEN"
+    assert sync["kanboard"]["token_env"] == "HERMES_KANBOARD_TOKEN"
+    assert sync["kanboard"]["username"] == "jsonrpc"

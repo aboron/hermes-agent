@@ -1,4 +1,4 @@
-# External kanban sync (Fizzy, …)
+# External kanban sync (Fizzy, Kanboard, …)
 
 Hermes can mirror a kanban board to a self-hosted external kanban
 service, so people file and steer work from a real kanban UI while the
@@ -13,10 +13,12 @@ watcher polls the remote service and keeps the two boards in step:
   close cards; archives park them.
 - Comments flow both ways with provenance prefixes.
 
-The first supported provider is [Fizzy](https://github.com/basecamp/fizzy),
-Basecamp's self-hostable kanban. The integration is a small provider
-interface (`hermes_cli/kanban_sync/provider.py`), so other services can
-be added by registering another provider.
+Two providers ship in-tree:
+[Fizzy](https://github.com/basecamp/fizzy), Basecamp's self-hostable
+kanban, and [Kanboard](https://kanboard.org), the PHP self-hosted
+classic. The integration is a small provider interface
+(`hermes_cli/kanban_sync/provider.py`), so other services can be added
+by registering another provider.
 
 ## Setup (Fizzy)
 
@@ -75,6 +77,61 @@ board ids.
 `HERMES_KANBAN_SYNC=0` in the gateway env disables the watcher without
 editing config (same escape-hatch pattern as
 `HERMES_KANBAN_DISPATCH_IN_GATEWAY`).
+
+## Setup (Kanboard)
+
+Kanboard talks JSON-RPC on a single endpoint; the provider only needs
+the instance root URL and a token.
+
+1. Grab a token. The simplest is the **application API token** from
+   *Settings → API* (it bypasses per-project permissions). To attribute
+   sync activity to a real account instead, use that user's **personal
+   API token** (*user profile → API*) and set `username` to their
+   login; sync comments are then posted as that user.
+
+2. Configure `~/.hermes/config.yaml` and pick the provider:
+
+   ```yaml
+   kanban:
+     sync:
+       provider: kanboard
+       kanboard:
+         base_url: "https://kanboard.example.com"
+         token_env: HERMES_KANBOARD_TOKEN   # or token: "..." inline
+         # username: alice                  # personal-token auth only
+   ```
+
+   Export the token in the gateway's environment:
+   `export HERMES_KANBOARD_TOKEN=...`
+
+3. Bootstrap and run exactly as with Fizzy: `hermes kanban sync init`,
+   then restart the gateway or drive passes with
+   `hermes kanban sync once`.
+
+### Kanboard notes
+
+- **Mirror init creates a clean project**: Kanboard seeds new projects
+  with default columns (Backlog / Ready / Work in progress / Done); the
+  provider removes them so the mirrored Hermes columns are the whole
+  board. `done` reuses Kanboard's native **close** state — completed
+  tasks disappear from the board (Kanboard's normal workflow), and
+  closing a task in the Kanboard UI completes it in Hermes.
+- **No inbox, no archive**: in mapped mode `triage` lands in the
+  project's **first column** (there is no untriaged state), and
+  `archived` **closes** the task — on the next pull that reads back as
+  `done`, once, then settles. In mirror mode both statuses get real
+  columns and neither quirk applies.
+- **Tags are not imported** (Kanboard task listings omit them), so the
+  `assignee:<profile>` tag mapping is unavailable — imports fall back
+  to `kanban.sync.default_assignee`. Nothing marks cards *golden*.
+- **Comment attribution**: Kanboard requires a posting user id. With
+  the application token, sync comments are posted as the built-in
+  admin (user id 1); with `username` auth, as that user. Either way
+  the `[hermes:<author>]` prefix carries the real provenance.
+- **Auth lockout**: three failed authentications lock the account
+  until it's unlocked via the web login form. A misconfigured token
+  surfaces as an auth error and the watcher backs off rather than
+  retrying — fix the credentials before restarting.
 
 ## Status ↔ location mapping
 
@@ -156,18 +213,18 @@ status untouched (the bridge has no opinion about custom columns).
 - **Export** (`kanban.sync.export`): tasks created locally (CLI,
   dashboard, agents) are exported as cards. `backfill: false` (default)
   only exports tasks created after the pairing existed.
-- Synced task bodies carry a trailing `[fizzy] <card url>` line linking
-  to the counterpart card.
+- Synced task bodies carry a trailing `[<provider>] <card url>` line
+  (e.g. `[fizzy] …`, `[kanboard] …`) linking to the counterpart card.
 
 ## Comments
 
 Comments sync both ways with provenance prefixes:
 
 - A local comment by `techlead` appears on the card as
-  `[hermes:techlead] …` (Fizzy attributes every API comment to the
-  token's user, so the prefix is the only reliable authorship signal).
+  `[hermes:techlead] …` (providers attribute every API comment to the
+  API user, so the prefix is the only reliable authorship signal).
 - A card comment by `Dana` appears on the task thread with author
-  `fizzy:Dana`.
+  `<provider>:Dana` (e.g. `fizzy:Dana`, `kanboard:Dana`).
 
 The engine keeps a ledger of comment refs it created or imported, so
 comments never ping-pong or duplicate even across cursor resets.
@@ -221,5 +278,5 @@ comment on the card and unlinks it.
   `Retry-After` on 429s is honored). One bad card never aborts a pass —
   it's recorded in `sync status` / stats errors.
 - **Trust boundary**: remote card content is untrusted input. Imported
-  comments are attributed to `fizzy:<name>` authors, and the sync never
-  grants remote content any authority beyond ordinary task text.
+  comments are attributed to `<provider>:<name>` authors, and the sync
+  never grants remote content any authority beyond ordinary task text.

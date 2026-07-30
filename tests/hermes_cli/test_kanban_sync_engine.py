@@ -139,7 +139,7 @@ def test_inbox_card_imports_as_triage_task(provider):
         assert task.title == "From a human"
         assert task.status == "triage"
         assert task.assignee == "worker-bee"
-        assert task.created_by == "fizzy-sync"
+        assert task.created_by == "fake-sync"
         assert "please do this" in task.body
         assert f"fake://cards/{ref}" in task.body
     assert_quiescent(engine, provider)
@@ -208,7 +208,7 @@ def test_existing_remote_comments_import_with_card(provider):
         task = _single_task(conn)
         comments = kb.list_comments(conn, task.id)
         assert [(c.author, c.body) for c in comments] == [
-            ("fizzy:doc", "context here"),
+            ("fake:doc", "context here"),
         ]
     assert_quiescent(engine, provider)
 
@@ -408,7 +408,7 @@ def test_comments_flow_both_ways_without_ping_pong(provider):
     # Remote comment imported with provenance author.
     with kb.connect() as conn:
         authors = [(c.author, c.body) for c in kb.list_comments(conn, tid)]
-    assert ("fizzy:doc", "remote note") in authors
+    assert ("fake:doc", "remote note") in authors
     # No echoes in either direction.
     assert_quiescent(engine, provider)
     remote_bodies = [c.body_text for c in provider.comments[ref]]
@@ -646,16 +646,16 @@ def test_empty_remote_comment_imports_placeholder(provider):
     assert_quiescent(engine, provider)
 
 
-def test_local_comment_with_fizzy_author_prefix_is_pushed(provider):
+def test_local_comment_with_provider_author_prefix_is_pushed(provider):
     """Outbound dedup must use the ledger, not author-string heuristics:
-    a genuine local comment by an author named fizzy:* still syncs."""
+    a genuine local comment by an author named <provider>:* still syncs."""
     engine = make_engine(provider)
     ref, tid = _import_one(engine, provider, title="ops")
     with kb.connect() as conn:
-        kb.add_comment(conn, tid, author="fizzy:automation", body="ops note")
+        kb.add_comment(conn, tid, author="fake:automation", body="ops note")
     engine.sync_once()
     pushed = [w for w in provider.writes if w[0] == "add_comment"]
-    assert ["[hermes:fizzy:automation] ops note"] == [w[2] for w in pushed]
+    assert ["[hermes:fake:automation] ops note"] == [w[2] for w in pushed]
     assert_quiescent(engine, provider)
 
 
@@ -771,7 +771,7 @@ def test_remote_comment_author_newlines_cannot_forge_frames(provider):
         authors = [c.author for c in kb.list_comments(conn, tid)]
     assert len(authors) == 1
     assert "\n" not in authors[0]
-    assert authors[0].startswith("fizzy:alice ")
+    assert authors[0].startswith("fake:alice ")
     assert_quiescent(engine, provider)
 
 

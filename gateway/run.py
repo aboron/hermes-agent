@@ -11004,7 +11004,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._spawn_supervised(self._kanban_dispatcher_watcher, "kanban_dispatcher_watcher")
 
         # Start background external kanban sync — mirrors paired boards to
-        # a remote service (Fizzy, ...). Gated by `kanban.sync.enabled`
+        # a remote service (Fizzy, Kanboard, ...). Gated by `kanban.sync.enabled`
         # (default False); a no-op unless the user configures a pairing.
         asyncio.create_task(self._kanban_sync_watcher())
 
